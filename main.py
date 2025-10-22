@@ -46,8 +46,8 @@ def reset_temp():
     TEMP.mkdir(exist_ok=True)
 
 def sanitize_title(raw: str) -> str:
-    import re
-    title = re.sub(r"^\s*(?:\d+\\s*[.)]|[-•・])\s*", "", raw)
+    # 正規表現バグ修正: "\\s" → "\s"
+    title = re.sub(r"^\s*(?:\d+\s*[.)]|[-•・])\s*", "", raw)
     title = re.sub(r"[\s\u3000]+", " ", title).strip()
     return title[:97] + "…" if len(title) > 100 else title or "Auto Video"
 
@@ -68,7 +68,7 @@ JP_CONV_LABEL = {
 def resolve_topic(arg_topic: str) -> str:
     if arg_topic and arg_topic.strip().lower() == "auto":
         first_audio_lang = COMBOS[0]["audio"]
-        topic = pick_by_content_type("vocab", first_audio_lang)  # ← vocabテーマ（英語ベースでOK）
+        topic = pick_by_content_type("vocab", first_audio_lang)  # ← vocabテーマ
         logging.info(f"[AUTO VOCAB THEME] {topic}")
         return topic
     return arg_topic
@@ -89,7 +89,6 @@ def _gen_example_sentence(word: str, lang_code: str) -> str:
             messages=[{"role":"user","content":prompt}],
             temperature=0.6,
         )
-        import re
         sent = (rsp.choices[0].message.content or "").strip()
         return re.sub(r'^[\"“”\'\s]+|[\"“”\'\s]+$', '', sent)
     except Exception:
@@ -98,6 +97,7 @@ def _gen_example_sentence(word: str, lang_code: str) -> str:
 def _gen_vocab_list(theme: str, lang_code: str, n: int) -> list[str]:
     """
     テーマから n 語の単語リストを生成。失敗時はフォールバック。
+    ※ フィルタ処理は撤去（プロンプト側で母語表記を強制している前提）
     """
     theme_for_prompt = translate(theme, lang_code) if lang_code != "en" else theme
     prompt = (
@@ -111,7 +111,7 @@ def _gen_vocab_list(theme: str, lang_code: str, n: int) -> list[str]:
             temperature=0.5,
         )
         words = [w.strip() for w in (rsp.choices[0].message.content or "").splitlines() if w.strip()]
-        import re
+        # 行頭番号の除去と重複排除のみ
         cleaned = []
         for w in words:
             w = re.sub(r"^\d+[\).]?\s*", "", w)
@@ -236,7 +236,7 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
     mp_parts, sub_rows = [], [[] for _ in subs]
     for i, (spk, line) in enumerate(valid_dialogue, 1):
         mp = TEMP / f"{i:02d}.mp3"
-        # ★ 修正点: 2行目無音の分岐を撤去 → 常に読み上げ
+        # 常に読み上げ（2行目の無音オプションは撤去）
         speak(audio_lang, spk, line, mp, style="neutral")
         mp_parts.append(mp)
         # 字幕を各言語で準備（音声言語=原文、それ以外は翻訳）

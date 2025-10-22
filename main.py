@@ -6,7 +6,7 @@ main.py – VOCAB専用版
 
 環境変数:
 - VOCAB_WORDS        : 生成する語数 (既定: 6)
-- VOCAB_SILENT_SECOND: ※本版では未使用（常に2行目も読み上げる）
+- DEBUG_SCRIPT       : "1" で台本・字幕・尺のデバッグファイルを TEMP に出力
 """
 
 import argparse, logging, re, json, subprocess, os
@@ -30,9 +30,8 @@ from topic_picker   import pick_by_content_type
 # ───────────────────────────────────────────────
 GPT = OpenAI()
 MAX_SHORTS_SEC = 59.0
-
-# 固定: vocab 専用
-CONTENT_MODE = "vocab"
+CONTENT_MODE   = "vocab"  # 固定: vocab 専用
+DEBUG_SCRIPT   = os.getenv("DEBUG_SCRIPT", "0") == "1"
 
 # ───────────────────────────────────────────────
 # combos.yaml 読み込み
@@ -97,7 +96,6 @@ def _gen_example_sentence(word: str, lang_code: str) -> str:
 def _gen_vocab_list(theme: str, lang_code: str, n: int) -> list[str]:
     """
     テーマから n 語の単語リストを生成。失敗時はフォールバック。
-    ※ フィルタ処理は撤去（プロンプト側で母語表記を強制している前提）
     """
     theme_for_prompt = translate(theme, lang_code) if lang_code != "en" else theme
     prompt = (
@@ -111,10 +109,9 @@ def _gen_vocab_list(theme: str, lang_code: str, n: int) -> list[str]:
             temperature=0.5,
         )
         words = [w.strip() for w in (rsp.choices[0].message.content or "").splitlines() if w.strip()]
-        # 行頭番号の除去と重複排除のみ
         cleaned = []
         for w in words:
-            w = re.sub(r"^\d+[\).]?\s*", "", w)
+            w = re.sub(r"^\d+[\).]?\s*", "", w)  # 番号除去
             if w and w not in cleaned:
                 cleaned.append(w)
         if len(cleaned) >= n:
@@ -175,7 +172,7 @@ def _concat_trim_to(mp_paths, max_sec, gap_ms=120):
     for idx, p in enumerate(mp_paths):
         seg = AudioSegment.from_file(p)
         seg_ms = len(seg)
-        extra = gap_ms if idx < len(mp_paths) - 1 else 0
+        extra = gap_ms if idx < len(mp_paths) - 1 else 0  # 最後以外は無音を付与
         need = seg_ms + extra
 
         remain = max_ms - elapsed
@@ -225,25 +222,27 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
         theme = topic
         vocab_words = _gen_vocab_list(theme, audio_lang, words_count)
 
-    # 1語あたり 3行ブロック: ①単語 → ②単語（訳字幕に出す）→ ③例文
+    # 1語あたり 3行ブロック: ①単語 → ②単語 → ③例文
     dialogue = []
     for w in vocab_words:
         ex = _gen_example_sentence(w, audio_lang)
         dialogue.extend([("N", w), ("N", w), ("N", ex)])
 
-    # 音声＆字幕
+    # 音声＆字幕の準備
     valid_dialogue = [(spk, line) for (spk, line) in dialogue if line.strip()]
     mp_parts, sub_rows = [], [[] for _ in subs]
+
+    # （A）script_raw/subs_table 用にプレーン文も保持
+    plain_lines = [line for (_, line) in valid_dialogue]
+
     for i, (spk, line) in enumerate(valid_dialogue, 1):
         mp = TEMP / f"{i:02d}.mp3"
-        # 常に読み上げ（2行目の無音オプションは撤去）
         speak(audio_lang, spk, line, mp, style="neutral")
         mp_parts.append(mp)
-        # 字幕を各言語で準備（音声言語=原文、それ以外は翻訳）
         for r, lang in enumerate(subs):
             sub_rows[r].append(line if lang == audio_lang else translate(line, lang))
 
-    # 結合・整音
+    # （B）音声を結合 → new_durs（各行尺）
     new_durs = _concat_trim_to(mp_parts, MAX_SHORTS_SEC, gap_ms=120)
     enhance(TEMP/"full_raw.mp3", TEMP/"full.mp3")
 
@@ -252,15 +251,51 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
     first_word = valid_dialogue[0][1] if valid_dialogue else theme
     fetch_bg(first_word, bg_png)
 
-    # 台本行数とオーディオ尺の整合
-    valid_dialogue = valid_dialogue[:len(new_durs)]
+    # （C）trim 適用後に使う行数
+    used = len(new_durs)
+    used_dialogue = valid_dialogue[:used]
+    used_sub_rows = [rows[:used] for rows in sub_rows]
+
+    # ── デバッグ出力（DEBUG_SCRIPT=1 のときだけ） ─────────────
+    if DEBUG_SCRIPT:
+        try:
+            # 1) script_raw.txt（生成テキストの素）
+            (TEMP / "script_raw.txt").write_text(
+                "\n".join(plain_lines), encoding="utf-8"
+            )
+            # 2) subs_table.tsv（全行×全字幕言語の表）
+            with open(TEMP / "subs_table.tsv", "w", encoding="utf-8") as f:
+                header = ["idx", "text"] + [f"sub:{code}" for code in subs]
+                f.write("\t".join(header) + "\n")
+                for idx in range(len(valid_dialogue)):
+                    row = [str(idx+1), valid_dialogue[idx][1]]
+                    for r in range(len(subs)):
+                        row.append(sub_rows[r][idx])
+                    f.write("\t".join(row) + "\n")
+            # 3) durations.txt（各行の秒数と合計）
+            with open(TEMP / "durations.txt", "w", encoding="utf-8") as f:
+                total = 0.0
+                for i, d in enumerate(new_durs, 1):
+                    total += d
+                    f.write(f"{i:02d}\t{d:.3f}s\n")
+                f.write(f"TOTAL\t{total:.3f}s\n")
+            # 4) script_joined.tsv（trim後に実際に使われたテキスト＋字幕＋尺）
+            with open(TEMP / "script_joined.tsv", "w", encoding="utf-8") as f:
+                header = ["idx", "text", "dur(s)"] + [f"sub:{code}" for code in subs]
+                f.write("\t".join(header) + "\n")
+                for i, ((_, txt), dur) in enumerate(zip(used_dialogue, new_durs), 1):
+                    row = [str(i), txt, f"{dur:.3f}"] + [used_sub_rows[r][i-1] for r in range(len(subs))]
+                    f.write("\t".join(row) + "\n")
+        except Exception as e:
+            logging.warning(f"[DEBUG_SCRIPT] write failed: {e}")
+    # ─────────────────────────────────────────────
 
     # lines.json 生成（[spk, sub1, sub2, ..., dur]）
     lines_data = []
-    for i, ((spk, txt), dur) in enumerate(zip(valid_dialogue, new_durs)):
+    for i, ((spk, txt), dur) in enumerate(zip(used_dialogue, new_durs)):
         row = [spk]
         for r in range(len(subs)):
-            row.append(sub_rows[r][i])
+            row.append(used_sub_rows[r][i])
         row.append(dur)
         lines_data.append(row)
     (TEMP/"lines.json").write_text(json.dumps(lines_data, ensure_ascii=False, indent=2), encoding="utf-8")

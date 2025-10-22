@@ -6,7 +6,7 @@ main.py – VOCAB専用版
 
 環境変数:
 - VOCAB_WORDS        : 生成する語数 (既定: 6)
-- VOCAB_SILENT_SECOND: "1" で各3行ブロックの2行目（=訳表示行）を無音にする(既定: 0)
+- VOCAB_SILENT_SECOND: ※本版では未使用（常に2行目も読み上げる）
 """
 
 import argparse, logging, re, json, subprocess, os
@@ -47,7 +47,7 @@ def reset_temp():
 
 def sanitize_title(raw: str) -> str:
     import re
-    title = re.sub(r"^\s*(?:\d+\s*[.)]|[-•・])\s*", "", raw)
+    title = re.sub(r"^\s*(?:\d+\\s*[.)]|[-•・])\s*", "", raw)
     title = re.sub(r"[\s\u3000]+", " ", title).strip()
     return title[:97] + "…" if len(title) > 100 else title or "Auto Video"
 
@@ -236,11 +236,8 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
     mp_parts, sub_rows = [], [[] for _ in subs]
     for i, (spk, line) in enumerate(valid_dialogue, 1):
         mp = TEMP / f"{i:02d}.mp3"
-        # 2行目（各ブロックの訳表示行）だけ無音にするオプション
-        if os.getenv("VOCAB_SILENT_SECOND","0") == "1" and (i % 3 == 2):
-            AudioSegment.silent(duration=900).export(mp, format="mp3")
-        else:
-            speak(audio_lang, spk, line, mp, style="neutral")
+        # ★ 修正点: 2行目無音の分岐を撤去 → 常に読み上げ
+        speak(audio_lang, spk, line, mp, style="neutral")
         mp_parts.append(mp)
         # 字幕を各言語で準備（音声言語=原文、それ以外は翻訳）
         for r, lang in enumerate(subs):

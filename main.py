@@ -29,6 +29,10 @@ GAP_MS       = int(os.getenv("GAP_MS", "120"))
 PRE_SIL_MS   = int(os.getenv("PRE_SIL_MS", "120"))
 MIN_UTTER_MS = int(os.getenv("MIN_UTTER_MS", "1000"))
 
+# 生成時の温度（必要なら環境変数で上書き）
+EX_TEMP   = float(os.getenv("EX_TEMP", "0.4"))   # 例文: 安定寄り
+LIST_TEMP = float(os.getenv("LIST_TEMP", "0.35")) # 語彙リスト: さらに安定
+
 LANG_NAME = {
     "en": "English", "pt": "Portuguese", "id": "Indonesian",
     "ja": "Japanese","ko": "Korean", "es": "Spanish",
@@ -71,49 +75,95 @@ def resolve_topic(arg_topic: str) -> str:
     return arg_topic
 
 # ───────────────────────────────────────────────
-# 例文クリーンアップ（控えめ）
+# 例文クリーンアップ & 検証
 # ───────────────────────────────────────────────
 _URL_RE   = re.compile(r"https?://\S+")
 _NUM_LEAD = re.compile(r"^\s*\d+[\).:\-]\s*")
 _QUOTES   = re.compile(r'^[\"“”\']+|[\"“”\']+$')
+_EMOJI_RE = re.compile(r"[\U00010000-\U0010ffff]")  # 4byte絵文字ざっくり
 
-def _clean_example(text: str) -> str:
-    if not text:
-        return ""
-    t = text.strip()
+def _normalize_spaces(t: str) -> str:
+    return re.sub(r"\s+", " ", t).strip()
+
+def _clean_example_strict(text: str) -> str:
+    t = (text or "").strip()
     t = _URL_RE.sub("", t)
     t = _NUM_LEAD.sub("", t)
     t = _QUOTES.sub("", t)
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
+    t = _EMOJI_RE.sub("", t)
+    # はみ出し記号
+    t = re.sub(r"[\:\-–—]\s*$", "", t)
+    return _normalize_spaces(t)
+
+def _is_single_sentence(text: str) -> bool:
+    # 終止の候補が2回以上なら複文扱い
+    return len(re.findall(r"[。.!?！？]", text)) <= 1
+
+def _fits_length(text: str, lang_code: str) -> bool:
+    if lang_code in ("ja", "ko", "zh"):
+        return len(text) <= 30
+    return len(re.findall(r"\b\w+\b", text)) <= 12
 
 def _ensure_period_for_sentence(txt: str, lang_code: str) -> str:
-    # 文の場合のみ終止記号を足す（単語行には使わない）
-    if re.search(r"[。.!?！？]$", txt):
+    if re.search(r"[。.!?！？]$", txt or ""):
         return txt
-    return txt + ("。" if lang_code == "ja" else ".")
+    return (txt or "") + ("。" if lang_code == "ja" else ".")
 
 # ───────────────────────────────────────────────
 # 語彙ユーティリティ
 # ───────────────────────────────────────────────
 def _gen_example_sentence(word: str, lang_code: str) -> str:
-    prompt = (
-        f"Write one short, natural example sentence (<=12 words) in "
-        f"{LANG_NAME.get(lang_code,'English')} using the word: {word}. "
-        "No translation, no quotes."
+    """
+    1文だけ生成し、バリデーション不合格なら最大3回まで再生成。
+    末尾句読点も保証。失敗時はフェールセーフ。
+    """
+    system = {
+        "role": "system",
+        "content": (
+            "You write a single, natural sentence. "
+            "Output exactly one sentence. No quotes, no lists, no emojis, no URLs."
+        ),
+    }
+    user_tpl = (
+        "Write exactly one short, natural sentence in {lang} using the word: {w}. "
+        "Keep it monolingual and plain (no brackets). "
+        "Length guide: <=12 words for alphabetic languages; concise for CJK. "
+        "Return ONLY the sentence."
     )
-    try:
-        rsp = GPT.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role":"user","content":prompt}],
-            temperature=0.6,
-        )
-        raw = (rsp.choices[0].message.content or "").strip()
-    except Exception:
-        raw = ""
+    lang_name = LANG_NAME.get(lang_code, "English")
+    prompt = user_tpl.format(lang=lang_name, w=word)
 
-    cleaned = _clean_example(raw)
-    return cleaned if cleaned else f"Let's practice {word}."
+    for _ in range(3):
+        raw = ""
+        try:
+            rsp = GPT.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[system, {"role":"user","content":prompt}],
+                temperature=EX_TEMP,     # ★ 安定寄り
+                top_p=1.0,
+                presence_penalty=0,
+                frequency_penalty=0,
+            )
+            raw = (rsp.choices[0].message.content or "").strip()
+        except Exception:
+            raw = ""
+
+        cand = _clean_example_strict(raw)
+        valid = bool(cand) and _is_single_sentence(cand) and _fits_length(cand, lang_code)
+
+        try:
+            contains_word = (word.lower() in cand.lower()) if lang_code not in ("ja","ko","zh") else (word in cand)
+        except Exception:
+            contains_word = True
+
+        if valid and contains_word:
+            return _ensure_period_for_sentence(cand, lang_code)
+
+    # フェールセーフ
+    if lang_code == "ja":
+        return _ensure_period_for_sentence(f"{word} を使ってみよう", lang_code)
+    else:
+        return _ensure_period_for_sentence(f"Let's practice {word}", lang_code)
 
 def _gen_vocab_list(theme: str, lang_code: str, n: int) -> list[str]:
     theme_for_prompt = translate(theme, lang_code) if lang_code != "en" else theme
@@ -121,23 +171,36 @@ def _gen_vocab_list(theme: str, lang_code: str, n: int) -> list[str]:
         f"List {n} essential single or hyphenated words for {theme_for_prompt} context "
         f"in {LANG_NAME.get(lang_code,'English')}. Return ONLY one word per line, no numbering."
     )
+    content = ""
     try:
         rsp = GPT.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role":"user","content":prompt}],
-            temperature=0.5,
+            temperature=LIST_TEMP,    # ★ より安定
+            top_p=1.0,
+            presence_penalty=0,
+            frequency_penalty=0,
         )
         content = (rsp.choices[0].message.content or "")
     except Exception:
         content = ""
-    words = [w.strip() for w in content.splitlines() if w and w.strip()]
-    cleaned = []
-    for w in words:
-        w = re.sub(r"^\d+[\).]?\s*", "", w)
-        if w and w not in cleaned:
-            cleaned.append(w)
-    if len(cleaned) >= n:
-        return cleaned[:n]
+
+    # 1行1語に正規化（余計な語は切り落とす）
+    words = []
+    for line in content.splitlines():
+        w = (line or "").strip()
+        if not w:
+            continue
+        w = re.sub(r"^\d+[\).]?\s*", "", w)   # 番号
+        w = re.sub(r"[，、。.!?！？]+$", "", w)  # 末尾句読点
+        # 先頭の単語（スペースがあれば最初だけ採用）
+        w = w.split()[0]
+        if w and w not in words:
+            words.append(w)
+
+    if len(words) >= n:
+        return words[:n]
+
     fallback = ["check-in", "reservation", "checkout", "receipt", "elevator", "lobby", "upgrade"]
     return fallback[:n]
 
@@ -145,8 +208,6 @@ def _gen_vocab_list(theme: str, lang_code: str, n: int) -> list[str]:
 # 日本語TTS用ふりがな
 # ───────────────────────────────────────────────
 _KANJI_ONLY = re.compile(r"^[一-龥々]+$")
-
-# 日本語TTS用：括弧を読まない（TTS文字列だけ）
 _PARENS_JA = re.compile(r"\s*[\(\（][^)\）]{1,40}[\)\）]\s*")
 
 def _kana_reading(word: str) -> str:
@@ -161,7 +222,10 @@ def _kana_reading(word: str) -> str:
                     f"単語: {word}"
                 )
             }],
-            temperature=0.0,
+            temperature=0.0,  # ★ 読みは決定論
+            top_p=1.0,
+            presence_penalty=0,
+            frequency_penalty=0,
         )
         yomi = (rsp.choices[0].message.content or "").strip()
         yomi = re.sub(r"[^ぁ-ゖゝゞー]+", "", yomi)
@@ -275,21 +339,17 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
     tts_lines   = []
 
     for i, (spk, line) in enumerate(valid_dialogue, 1):
-        # 行の種類（1:単語, 2:単語, 3:例文）
         role_idx = (i - 1) % 3  # 0/1/2
 
         tts_line = line
         if audio_lang == "ja":
-            # 例文の括弧はTTSでは読まない（日本語のみ）
             if role_idx == 2:
-                tts_line = _PARENS_JA.sub(" ", tts_line).strip()
-            # 漢字のみの「単語」は読みへ（1・2行目のみ対象で十分）
+                tts_line = _PARENS_JA.sub(" ", tts_line).strip()  # 例文の括弧は読まない
             if role_idx in (0, 1) and _KANJI_ONLY.fullmatch(line):
                 yomi = _kana_reading(line)
                 if yomi:
                     tts_line = yomi
 
-        # 句読点付与は「例文行のみ」
         if role_idx == 2:
             tts_line = _ensure_period_for_sentence(tts_line, audio_lang)
 
@@ -298,7 +358,6 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
         audio_parts.append(out_audio)
         tts_lines.append(tts_line)
 
-        # 字幕（音声言語=原文、他言語=翻訳）
         for r, lang in enumerate(subs):
             sub_rows[r].append(line if lang == audio_lang else translate(line, lang))
 

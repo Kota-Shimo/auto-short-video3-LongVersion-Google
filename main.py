@@ -5,8 +5,12 @@ main.py – VOCAB専用版
 → TTS → lines.json & full.mp3 → chunk_builder.py で動画 → （任意）YouTubeアップロード
 
 環境変数:
-- VOCAB_WORDS        : 生成する語数 (既定: 6)
-- DEBUG_SCRIPT       : "1" で台本・字幕・尺のデバッグファイルを TEMP に出力
+- VOCAB_WORDS  : 生成する語数 (既定: 6)
+- DEBUG_SCRIPT : "1" で台本・字幕・尺のデバッグファイルを TEMP に出力
+
+音切れ対策:
+- 行間無音を 300ms に拡大
+- 各行オーディオの最短尺を 900ms にパディング（超短発声での「ッ」音防止）
 """
 
 import argparse, logging, re, json, subprocess, os
@@ -162,15 +166,22 @@ def make_tags(theme, audio_lang, subs, title_lang):
     return out[:15]
 
 # ───────────────────────────────────────────────
-# 音声結合・トリム（行間に無音ギャップを持たせ、dur にも反映）
+# 音声結合・トリム
+#   - gap_ms: 行間に入れる無音（既定 300ms）
+#   - min_ms: 各行の最短尺（既定 900ms 未満の音声は後ろに無音を付与）
 # ───────────────────────────────────────────────
-def _concat_trim_to(mp_paths, max_sec, gap_ms=120):
+def _concat_trim_to(mp_paths, max_sec, gap_ms=300, min_ms=900):
     max_ms = int(max_sec * 1000)
     combined = AudioSegment.silent(duration=0)
     new_durs, elapsed = [], 0
 
     for idx, p in enumerate(mp_paths):
         seg = AudioSegment.from_file(p)
+
+        # ★最短尺パディング（単語のプツ切れ防止）
+        if len(seg) < min_ms:
+            seg = seg + AudioSegment.silent(duration=min_ms - len(seg))
+
         seg_ms = len(seg)
         extra = gap_ms if idx < len(mp_paths) - 1 else 0  # 最後以外は無音を付与
         need = seg_ms + extra
@@ -243,7 +254,7 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
             sub_rows[r].append(line if lang == audio_lang else translate(line, lang))
 
     # （B）音声を結合 → new_durs（各行尺）
-    new_durs = _concat_trim_to(mp_parts, MAX_SHORTS_SEC, gap_ms=120)
+    new_durs = _concat_trim_to(mp_parts, MAX_SHORTS_SEC, gap_ms=300, min_ms=900)
     enhance(TEMP/"full_raw.mp3", TEMP/"full.mp3")
 
     # 背景：最初の単語を使う

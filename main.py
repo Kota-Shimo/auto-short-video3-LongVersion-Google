@@ -4,6 +4,7 @@ main.py – VOCAB専用版（単純結合＋日本語ふりがな[TTSのみ]＋�
 - 例文は常に「1文だけ」。バリデーション失敗時は最大3回まで再生成し、最後はフェールセーフ。
 - 翻訳（字幕）は1行化し、複文は先頭1文のみ採用。URL/絵文字/余分な空白を除去。
 - 追加: TARGET_ACCOUNT/--account で combos をアカウント単位に絞り込み可能。
+- 追加: topic_picker の文脈ヒント（context）を例文生成に渡して日本語崩れを抑制。
 """
 
 import argparse, logging, re, json, subprocess, os
@@ -70,11 +71,7 @@ def _infer_title_lang(audio_lang: str, subs: list[str], combo: dict) -> str:
     return audio_lang
 
 def resolve_topic(arg_topic: str) -> str:
-    if arg_topic and arg_topic.strip().lower() == "auto":
-        first_audio_lang = COMBOS[0]["audio"]
-        topic = pick_by_content_type("vocab", first_audio_lang)
-        logging.info(f"[AUTO VOCAB THEME] {topic}")
-        return topic
+    # 手入力の topic はそのまま通す（AUTO時の処理は run_all 内で実施）
     return arg_topic
 
 # ───────────────────────────────────────────────
@@ -162,14 +159,14 @@ def _example_temp_for(lang_code: str) -> float:
     # 日本語は特に崩れやすいのでさらに低温度
     return 0.20 if lang_code == "ja" else EX_TEMP_DEFAULT
 
-def _gen_example_sentence(word: str, lang_code: str, topic: str = "") -> str:
+def _gen_example_sentence(word: str, lang_code: str, context_hint: str = "") -> str:
     """
     1文だけ生成。バリデーション不合格なら最大3回まで再生成。
     失敗時フェールセーフ（ja: テンプレ / 他言語: Let's practice ...）
-    テーマ（topic）を文脈ヒントとして活用。
+    context_hint を文脈ヒントとして活用。
     """
     lang_name = LANG_NAME.get(lang_code, "English")
-    topic_hint = (topic or "").strip()
+    ctx = (context_hint or "").strip()
 
     system = {
         "role": "system",
@@ -185,15 +182,15 @@ def _gen_example_sentence(word: str, lang_code: str, topic: str = "") -> str:
             "日常の簡単な状況を想定し、助詞の使い方を自然にしてください。"
             "かっこ書きや翻訳注釈は不要です。"
         )
-        if topic_hint:
-            user += f" テーマは『{topic_hint}』です。"
+        if ctx:
+            user += f" シーンの文脈: {ctx}"
     else:
         user = (
             f"Write exactly ONE short, natural sentence in {lang_name} that uses the word: {word}. "
-            "Imagine a simple everyday scene if helpful. Return ONLY the sentence."
+            "Return ONLY the sentence."
         )
-        if topic_hint:
-            user += f" Scene topic: {topic_hint}."
+        if ctx:
+            user += f" Scene hint: {ctx}"
 
     for _ in range(3):
         try:
@@ -366,7 +363,7 @@ def _concat_with_gaps(audio_paths, gap_ms=120, pre_ms=120, min_ms=1000):
 # ───────────────────────────────────────────────
 # 1コンボ処理
 # ───────────────────────────────────────────────
-def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_upload, chunk_size):
+def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_upload, chunk_size, context_hint=""):
     reset_temp()
 
     raw = (topic or "").replace("\r", "\n").strip()
@@ -376,14 +373,16 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
     if is_word_list:
         vocab_words = [w.strip() for w in re.split(r"[\n,;]+", raw) if w.strip()]
         theme = "custom list"
+        local_context = ""  # 手入力リスト時は文脈ヒントなし
     else:
         theme = topic
         vocab_words = _gen_vocab_list(theme, audio_lang, words_count)
+        local_context = context_hint or ""  # AUTO時に受け取った文脈を使う
 
     # 3行ブロック: 単語 → 単語 → 例文
     dialogue = []
     for w in vocab_words:
-        ex = _gen_example_sentence(w, audio_lang, topic)  # ← テーマを文脈ヒントに渡す
+        ex = _gen_example_sentence(w, audio_lang, local_context)
         dialogue.extend([("N", w), ("N", w), ("N", ex)])
 
     valid_dialogue = [(spk, line) for (spk, line) in dialogue if line.strip()]
@@ -511,14 +510,27 @@ def run_all(topic, turns, privacy, do_upload, chunk_size):
         if TARGET_ONLY and account != TARGET_ONLY:
             continue
 
-        logging.info(f"=== Combo: {audio_lang}, subs={subs}, account={account}, title_lang={title_lang}, mode={CONTENT_MODE} ===")
-
+        # テーマ＆文脈の決定
         picked_topic = topic
+        context_hint = ""
         if topic.strip().lower() == "auto":
-            picked_topic = pick_by_content_type("vocab", audio_lang)
-            logging.info(f"[{audio_lang}] picked vocab theme: {picked_topic}")
+            # テーマと文脈ヒントを同時取得（topic_picker.py の拡張版に対応）
+            try:
+                theme_ctx = pick_by_content_type("vocab", audio_lang, return_context=True)
+                # 旧版の topic_picker を使っている場合は str が返るので後方互換
+                if isinstance(theme_ctx, tuple) and len(theme_ctx) == 2:
+                    picked_topic, context_hint = theme_ctx
+                else:
+                    picked_topic = str(theme_ctx)
+                    context_hint = ""
+            except TypeError:
+                # 関数シグネチャが古い環境（return_context 未対応）の場合
+                picked_topic = pick_by_content_type("vocab", audio_lang)
+                context_hint = ""
+            logging.info(f"[{audio_lang}] picked vocab theme: {picked_topic} | ctx: {context_hint or '-'}")
 
-        run_one(picked_topic, turns, audio_lang, subs, title_lang, privacy, account, do_upload, chunk_size)
+        logging.info(f"=== Combo: {audio_lang}, subs={subs}, account={account}, title_lang={title_lang}, mode={CONTENT_MODE} ===")
+        run_one(picked_topic, turns, audio_lang, subs, title_lang, privacy, account, do_upload, chunk_size, context_hint=context_hint)
 
 # ───────────────────────────────────────────────
 if __name__ == "__main__":

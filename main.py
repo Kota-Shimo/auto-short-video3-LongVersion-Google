@@ -1,18 +1,20 @@
 #!/usr/bin/env python
 """
-main.py – VOCAB専用版（単純結合＋日本語ふりがな[TTSのみ]対応）
+main.py – VOCAB専用版（単純結合＋日本語ふりがな[TTSのみ]＋先頭無音＋最短1秒）
 
 パイプライン:
   単語テーマ（AUTO→topic_picker）→ 単語リスト生成
   → [単語→単語→例文] を繰り返し
-  → TTS（日本語の「漢字だけ単語」はTTS用にふりがな付与／字幕は原文のまま）
-  → （無音ギャップを挟んで）単純結合して full.mp3
+  → TTS（日本語の「漢字だけ単語」はTTS用にひらがな読みを適用／字幕は原文のまま）
+  → 単純結合（各行 前無音＋最短尺＋行間ギャップ）で full_raw.wav → enhance → full.wav → full.mp3
   → lines.json → chunk_builder.py → （任意）YouTubeアップロード
 
 環境変数:
 - VOCAB_WORDS   : 生成する語数 (既定: 6)
 - DEBUG_SCRIPT  : "1" で台本・字幕・尺のデバッグファイルを TEMP に出力
-- GAP_MS        : 発話間に挿入する無音（ミリ秒, 既定: 120）
+- GAP_MS        : 行間に挿入する無音（ms, 既定: 120）
+- PRE_SIL_MS    : 各行の先頭に入れる無音（ms, 既定: 120）
+- MIN_UTTER_MS  : 各行の最短尺（ms, 既定: 1000）
 """
 
 import argparse, logging, re, json, subprocess, os
@@ -35,9 +37,11 @@ from topic_picker   import pick_by_content_type
 
 # ───────────────────────────────────────────────
 GPT = OpenAI()
-CONTENT_MODE = "vocab"      # 固定
+CONTENT_MODE = "vocab"  # 固定
 DEBUG_SCRIPT = os.getenv("DEBUG_SCRIPT", "0") == "1"
-GAP_MS       = int(os.getenv("GAP_MS", "120"))  # 無音ギャップ
+GAP_MS       = int(os.getenv("GAP_MS", "120"))     # 行間ギャップ
+PRE_SIL_MS   = int(os.getenv("PRE_SIL_MS", "120")) # 行頭サイレント
+MIN_UTTER_MS = int(os.getenv("MIN_UTTER_MS", "1000"))  # 各行の最短尺
 
 # ───────────────────────────────────────────────
 # combos.yaml 読み込み
@@ -130,7 +134,7 @@ def _gen_vocab_list(theme: str, lang_code: str, n: int) -> list[str]:
 _KANJI_ONLY = re.compile(r"^[一-龥々]+$")
 
 def _kana_reading(word: str) -> str:
-    """漢字のみの単語に対してひらがな読みを返す（短く・記号なし）"""
+    """漢字のみの単語に対してひらがな読みを返す（記号なし・短く）"""
     try:
         rsp = GPT.chat.completions.create(
             model="gpt-4o-mini",
@@ -189,21 +193,24 @@ def make_tags(theme, audio_lang, subs, title_lang):
     return out[:15]
 
 # ───────────────────────────────────────────────
-# 単純結合（トリミング無し）：各行の長さ + ギャップを dur に採用
+# 単純結合（WAV中間・行頭無音・最短尺・行間ギャップ）
 # ───────────────────────────────────────────────
-def _concat_with_gaps(mp_paths, gap_ms=120):
+def _concat_with_gaps(audio_paths, gap_ms=120, pre_ms=120, min_ms=1000):
     combined = AudioSegment.silent(duration=0)
     durs = []
-    for idx, p in enumerate(mp_paths):
+    for idx, p in enumerate(audio_paths):
         seg = AudioSegment.from_file(p)
+        seg = AudioSegment.silent(duration=pre_ms) + seg  # 先頭に無音
+        if len(seg) < min_ms:
+            seg += AudioSegment.silent(duration=min_ms - len(seg))
         seg_ms = len(seg)
+        extra = gap_ms if idx < len(audio_paths) - 1 else 0
         combined += seg
-        extra = gap_ms if idx < len(mp_paths) - 1 else 0
         if extra:
             combined += AudioSegment.silent(duration=extra)
         durs.append((seg_ms + extra) / 1000.0)
-    (TEMP / "full_raw.mp3").unlink(missing_ok=True)
-    combined.export(TEMP / "full_raw.mp3", format="mp3")
+    (TEMP / "full_raw.wav").unlink(missing_ok=True)
+    combined.export(TEMP / "full_raw.wav", format="wav")
     return durs
 
 # ───────────────────────────────────────────────
@@ -234,29 +241,35 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
     valid_dialogue = [(spk, line) for (spk, line) in dialogue if line.strip()]
     mp_parts, sub_rows = [], [[] for _ in subs]
 
-    # 生成テキスト（字幕用の素）は保存しておく
+    # デバッグ用保持
     plain_lines = [line for (_, line) in valid_dialogue]
+    tts_lines   = []
 
     for i, (spk, line) in enumerate(valid_dialogue, 1):
-        # ── TTS用テキスト最終化（日本語・漢字のみの“単語”に読みを付与）──
+        # ── TTS用テキスト（日本語の漢字-only単語は読みを使う） ──
         tts_line = line
         if audio_lang == "ja" and _KANJI_ONLY.fullmatch(line):
             yomi = _kana_reading(line)
             if yomi:
-                tts_line = f"{line}"  # 音声は読みを強制、字幕は原文のまま
+                tts_line = yomi
+        # 句点付与で読み切りを安定
+        if audio_lang in ("ja",) and not re.search(r"[。.!?！？]$", tts_line):
+            tts_line += "。"
 
-        # 音声合成
-        mp = TEMP / f"{i:02d}.mp3"
-        speak(audio_lang, spk, tts_line, mp, style="neutral")
-        mp_parts.append(mp)
+        # 音声合成（拡張子はWAVを推奨：中間をWAVで統一）
+        out_audio = TEMP / f"{i:02d}.wav"
+        speak(audio_lang, spk, tts_line, out_audio, style="neutral")
+        mp_parts.append(out_audio)
+        tts_lines.append(tts_line)
 
         # 字幕（音声言語=原文、他言語=翻訳）※ふりがなは入れない
         for r, lang in enumerate(subs):
             sub_rows[r].append(line if lang == audio_lang else translate(line, lang))
 
-    # 単純結合（無音ギャップ挿入、トリム無し）
-    new_durs = _concat_with_gaps(mp_parts, gap_ms=GAP_MS)
-    enhance(TEMP/"full_raw.mp3", TEMP/"full.mp3")
+    # 単純結合（WAV）→ enhance（WAV）→ 最終MP3
+    new_durs = _concat_with_gaps(mp_parts, gap_ms=GAP_MS, pre_ms=PRE_SIL_MS, min_ms=MIN_UTTER_MS)
+    enhance(TEMP/"full_raw.wav", TEMP/"full.wav")
+    AudioSegment.from_file(TEMP/"full.wav").export(TEMP/"full.mp3", format="mp3")
 
     # 背景：最初の単語を使う
     bg_png = TEMP / "bg.png"
@@ -277,6 +290,7 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
     if DEBUG_SCRIPT:
         try:
             (TEMP / "script_raw.txt").write_text("\n".join(plain_lines), encoding="utf-8")
+            (TEMP / "script_tts.txt").write_text("\n".join(tts_lines), encoding="utf-8")
             with open(TEMP / "subs_table.tsv", "w", encoding="utf-8") as f:
                 header = ["idx", "text"] + [f"sub:{code}" for code in subs]
                 f.write("\t".join(header) + "\n")
@@ -295,7 +309,7 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
     if args.lines_only:
         return
 
-    # サムネ
+    # サムネ（タイトル言語はサブ2列目があればそれを優先）
     thumb = TEMP / "thumbnail.jpg"
     thumb_lang = subs[1] if len(subs) > 1 else audio_lang
     make_thumbnail(theme, thumb_lang, thumb)

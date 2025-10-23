@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 """
 main.py – VOCAB専用版（単純結合＋日本語ふりがな[TTSのみ]＋先頭無音＋最短1秒）
+- 例文は常に「1文だけ」。バリデーション失敗時は最大3回まで再生成し、最後はフェールセーフ。
+- 翻訳（字幕）は1行化し、複文は先頭1文のみ採用。URL/絵文字/余分な空白を除去。
 """
 
 import argparse, logging, re, json, subprocess, os
@@ -29,9 +31,9 @@ GAP_MS       = int(os.getenv("GAP_MS", "120"))
 PRE_SIL_MS   = int(os.getenv("PRE_SIL_MS", "120"))
 MIN_UTTER_MS = int(os.getenv("MIN_UTTER_MS", "1000"))
 
-# 生成温度（環境変数で上書き可）: 低温で安定寄り
-EX_TEMP   = float(os.getenv("EX_TEMP", "0.25"))   # 例文
-LIST_TEMP = float(os.getenv("LIST_TEMP", "0.25")) # 語彙リスト
+# 生成時の温度（必要なら環境変数で上書き）
+EX_TEMP_DEFAULT = float(os.getenv("EX_TEMP", "0.35"))   # 例文
+LIST_TEMP       = float(os.getenv("LIST_TEMP", "0.30")) # 語彙リスト
 
 LANG_NAME = {
     "en": "English", "pt": "Portuguese", "id": "Indonesian",
@@ -75,106 +77,82 @@ def resolve_topic(arg_topic: str) -> str:
     return arg_topic
 
 # ───────────────────────────────────────────────
-# 例文クリーンアップ & 検証
+# クリーニング・バリデーション共通
 # ───────────────────────────────────────────────
-_URL_RE    = re.compile(r"https?://\S+")
-_NUM_LEAD  = re.compile(r"^\s*\d+[\).:\-]\s*")
-_QUOTES    = re.compile(r'^[\"“”\']+|[\"“”\']+$')
-_EMOJI_RE  = re.compile(r"[\U00010000-\U0010ffff]")  # おおまかな絵文字
-_ASCII_LET = re.compile(r"[A-Za-z]+")
+_URL_RE   = re.compile(r"https?://\S+")
+_NUM_LEAD = re.compile(r"^\s*\d+[\).:\-]\s*")
+_QUOTES   = re.compile(r'^[\"“”\']+|[\"“”\']+$')
+_EMOJI_RE = re.compile(r"[\U00010000-\U0010ffff]")  # ざっくり絵文字
+_SENT_END = re.compile(r"[。.!?！？]")
 
 def _normalize_spaces(t: str) -> str:
-    return re.sub(r"\s+", " ", t or "").strip()
+    return re.sub(r"\s+", " ", (t or "")).strip()
 
-def _clean_example_common(text: str) -> str:
+def _clean_strict(text: str) -> str:
     t = (text or "").strip()
     t = _URL_RE.sub("", t)
     t = _NUM_LEAD.sub("", t)
     t = _QUOTES.sub("", t)
     t = _EMOJI_RE.sub("", t)
-    t = re.sub(r"[\:\-–—]\s*$", "", t)  # 行末の記号だまり
+    # 末尾の余計な記号
+    t = re.sub(r"[\:\-–—]\s*$", "", t)
     return _normalize_spaces(t)
 
-# CJK率チェック（日本語の一貫性担保）
-_CJK_RE = re.compile(r"[\u3040-\u30FF\u4E00-\u9FFF\u3000-\u303F]")  # ひらがな・カタカナ・漢字・句読点等
-
-def _cjk_ratio(s: str) -> float:
-    if not s:
-        return 0.0
-    cjk = len(_CJK_RE.findall(s))
-    return cjk / max(len(s), 1)
-
-def _ensure_period_for_sentence(txt: str, lang_code: str) -> str:
-    if re.search(r"[。.!?！？]$", txt or ""):
-        return txt
-    return (txt or "") + ("。" if lang_code == "ja" else ".")
-
 def _is_single_sentence(text: str) -> bool:
-    # 終止記号が2個以上あるなら複文っぽいとみなす
-    return len(re.findall(r"[。.!?！？]", text or "")) <= 1
+    return len(_SENT_END.findall(text or "")) <= 1
 
 def _fits_length(text: str, lang_code: str) -> bool:
     if lang_code in ("ja", "ko", "zh"):
-        return len(text or "") <= 24   # 以前より少し短めで安定
-    # アルファベット系：単語数12以下
+        return len(text or "") <= 30
+    # 英語などは語数で
     return len(re.findall(r"\b\w+\b", text or "")) <= 12
 
-def _postprocess_example(text: str, lang_code: str) -> str:
-    """
-    生成直後に“字幕用の正規化済み本文”を作る。
-    ここで安定させたものを台本に採用する（＝TTS/字幕の素になる）。
-    """
-    t = _clean_example_common(text)
+def _ensure_period_for_sentence(txt: str, lang_code: str) -> str:
+    t = txt or ""
+    return t if re.search(r"[。.!?！？]$", t) else t + ("。" if lang_code == "ja" else ".")
 
-    if lang_code == "ja":
-        # ローマ字/英単語は削る（数字は保持）
-        t = _ASCII_LET.sub("", t)
-        # 三点リーダの統一
-        t = t.replace("...", "。").replace("…", "。")
-        # 余分な空白
-        t = _normalize_spaces(t)
-        # CJK率が低い＝混在が多い → 破棄
-        if _cjk_ratio(t) < 0.8:
-            t = ""
-    # 最終チェック
-    if not t:
-        return t
-    if not _is_single_sentence(t) or not _fits_length(t, lang_code):
-        return ""
-    return _ensure_period_for_sentence(t, lang_code)
+# 字幕用クリーン（翻訳結果に適用）
+def _clean_sub_line(text: str, lang_code: str) -> str:
+    t = _clean_strict(text).replace("\n", " ").strip()
+    # 複文は「最初の終止まで」を採用
+    m = _SENT_END.search(t)
+    if m:
+        end = m.end()
+        t = t[:end]
+    return t
 
 # ───────────────────────────────────────────────
 # 語彙ユーティリティ
 # ───────────────────────────────────────────────
+def _example_temp_for(lang_code: str) -> float:
+    # 日本語は特に崩れやすいのでさらに低温度
+    return 0.25 if lang_code == "ja" else EX_TEMP_DEFAULT
+
 def _gen_example_sentence(word: str, lang_code: str) -> str:
     """
-    1文だけ生成。検証NGなら最大3回リトライ。失敗時はフェールセーフ。
-    台本に載せるのは“ポストプロセス済み”の文。
+    1文だけ生成。バリデーション不合格なら最大3回まで再生成。
+    失敗時フェールセーフ（ja: 「〜を使ってみよう。」/ 他言語: Let's practice ...）
     """
     system = {
         "role": "system",
         "content": (
-            "You write a single, natural sentence. "
-            "Output exactly one sentence. No quotes, no lists, no emojis, no URLs."
+            "You write exactly one natural sentence. "
+            "No lists, no quotes, no emojis, no URLs."
         ),
     }
-    user_tpl = (
-        "Write exactly one short, natural sentence in {lang} that uses the word: {w}. "
-        "Keep it monolingual and plain (no brackets or glosses). "
-        "Length guide: <=12 words for alphabetic languages; concise for CJK. "
-        "Return ONLY the sentence."
-    )
     lang_name = LANG_NAME.get(lang_code, "English")
-    prompt = user_tpl.format(lang=lang_name, w=word)
+    user = (
+        f"Write exactly ONE short sentence in {lang_name} that uses the word: {word}. "
+        "Keep it plain and monolingual. Return ONLY the sentence."
+    )
 
     for _ in range(3):
-        raw = ""
         try:
             rsp = GPT.chat.completions.create(
                 model="gpt-4o-mini",
-                messages=[system, {"role":"user","content":prompt}],
-                temperature=EX_TEMP,
-                top_p=1.0,
+                messages=[system, {"role":"user","content":user}],
+                temperature=_example_temp_for(lang_code),
+                top_p=0.9,
                 presence_penalty=0,
                 frequency_penalty=0,
             )
@@ -182,22 +160,20 @@ def _gen_example_sentence(word: str, lang_code: str) -> str:
         except Exception:
             raw = ""
 
-        cand = _postprocess_example(raw, lang_code)
-
-        # 単語を含むか（CJKは素直に一致）
+        cand = _clean_strict(raw)
+        valid = bool(cand) and _is_single_sentence(cand) and _fits_length(cand, lang_code)
         try:
             contains_word = (word.lower() in cand.lower()) if lang_code not in ("ja","ko","zh") else (word in cand)
         except Exception:
             contains_word = True
 
-        if cand and contains_word:
-            return cand
+        if valid and contains_word:
+            return _ensure_period_for_sentence(cand, lang_code)
 
     # フェールセーフ
     if lang_code == "ja":
         return _ensure_period_for_sentence(f"{word} を使ってみよう", lang_code)
-    else:
-        return _ensure_period_for_sentence(f"Let's practice {word}", lang_code)
+    return _ensure_period_for_sentence(f"Let's practice {word}", lang_code)
 
 def _gen_vocab_list(theme: str, lang_code: str, n: int) -> list[str]:
     theme_for_prompt = translate(theme, lang_code) if lang_code != "en" else theme
@@ -211,7 +187,7 @@ def _gen_vocab_list(theme: str, lang_code: str, n: int) -> list[str]:
             model="gpt-4o-mini",
             messages=[{"role":"user","content":prompt}],
             temperature=LIST_TEMP,
-            top_p=1.0,
+            top_p=0.9,
             presence_penalty=0,
             frequency_penalty=0,
         )
@@ -219,22 +195,19 @@ def _gen_vocab_list(theme: str, lang_code: str, n: int) -> list[str]:
     except Exception:
         content = ""
 
-    # 1行1語に正規化（重複除去）。ハイフン語は許可。
     words = []
     for line in content.splitlines():
         w = (line or "").strip()
         if not w:
             continue
-        w = re.sub(r"^\d+[\).]?\s*", "", w)   # 行頭番号
+        w = re.sub(r"^\d+[\).]?\s*", "", w)     # 番号
         w = re.sub(r"[，、。.!?！？]+$", "", w)  # 末尾句読点
-        # カンマ/セミコロン/スラッシュ で分割し、先頭トークンを採用
-        w = re.split(r"[,\;/\t ]+", w)[0]
+        w = w.split()[0]                        # 先頭トークン
         if w and w not in words:
             words.append(w)
 
     if len(words) >= n:
         return words[:n]
-
     fallback = ["check-in", "reservation", "checkout", "receipt", "elevator", "lobby", "upgrade"]
     return fallback[:n]
 
@@ -256,10 +229,8 @@ def _kana_reading(word: str) -> str:
                     f"単語: {word}"
                 )
             }],
-            temperature=0.0,  # 決定論
+            temperature=0.0,
             top_p=1.0,
-            presence_penalty=0,
-            frequency_penalty=0,
         )
         yomi = (rsp.choices[0].message.content or "").strip()
         yomi = re.sub(r"[^ぁ-ゖゝゞー]+", "", yomi)
@@ -363,9 +334,8 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
     # 3行ブロック: 単語 → 単語 → 例文
     dialogue = []
     for w in vocab_words:
-        ex_raw = _gen_example_sentence(w, audio_lang)
-        # ★ 例文はここで既にポストプロセス済（_gen_example_sentence 内）
-        dialogue.extend([("N", w), ("N", w), ("N", ex_raw)])
+        ex = _gen_example_sentence(w, audio_lang)
+        dialogue.extend([("N", w), ("N", w), ("N", ex)])
 
     valid_dialogue = [(spk, line) for (spk, line) in dialogue if line.strip()]
     audio_parts, sub_rows = [], [[] for _ in subs]
@@ -376,17 +346,15 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
     for i, (spk, line) in enumerate(valid_dialogue, 1):
         role_idx = (i - 1) % 3  # 0/1/2
 
-        # TTSテキスト
         tts_line = line
         if audio_lang == "ja":
             if role_idx == 2:
-                # 例文の括弧はTTSでは読まない（字幕はそのまま）
-                tts_line = _PARENS_JA.sub(" ", tts_line).strip()
+                tts_line = _PARENS_JA.sub(" ", tts_line).strip()  # 例文の括弧は読まない
             if role_idx in (0, 1) and _KANJI_ONLY.fullmatch(line):
                 yomi = _kana_reading(line)
                 if yomi:
                     tts_line = yomi
-        # 例文末尾の句読点は確実に
+
         if role_idx == 2:
             tts_line = _ensure_period_for_sentence(tts_line, audio_lang)
 
@@ -395,9 +363,16 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
         audio_parts.append(out_audio)
         tts_lines.append(tts_line)
 
-        # 字幕（音声言語=台本原文、他言語=翻訳）
+        # 字幕（音声言語=原文、他言語=翻訳）→ クリーニングして1行化
         for r, lang in enumerate(subs):
-            sub_rows[r].append(line if lang == audio_lang else translate(line, lang))
+            if lang == audio_lang:
+                sub_rows[r].append(_clean_sub_line(line, lang))
+            else:
+                try:
+                    trans = translate(line, lang)
+                except Exception:
+                    trans = line
+                sub_rows[r].append(_clean_sub_line(trans, lang))
 
     # 単純結合 → 整音 → mp3
     new_durs = _concat_with_gaps(audio_parts, gap_ms=GAP_MS, pre_ms=PRE_SIL_MS, min_ms=MIN_UTTER_MS)
@@ -419,6 +394,7 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
         lines_data.append(row)
     (TEMP/"lines.json").write_text(json.dumps(lines_data, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    # デバッグ出力（列見やすいよう header を明示）
     if DEBUG_SCRIPT:
         try:
             (TEMP / "script_raw.txt").write_text("\n".join(plain_lines), encoding="utf-8")
@@ -427,7 +403,9 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
                 header = ["idx", "text"] + [f"sub:{code}" for code in subs]
                 f.write("\t".join(header) + "\n")
                 for idx in range(len(valid_dialogue)):
-                    row = [str(idx+1), valid_dialogue[idx][1]] + [sub_rows[r][idx] for r in range(len(subs))]
+                    row = [str(idx+1), _clean_sub_line(valid_dialogue[idx][1], audio_lang)]
+                    for r in range(len(subs)):
+                        row.append(sub_rows[r][idx])
                     f.write("\t".join(row) + "\n")
             with open(TEMP / "durations.txt", "w", encoding="utf-8") as f:
                 total = 0.0

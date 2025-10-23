@@ -123,29 +123,77 @@ def _clean_sub_line(text: str, lang_code: str) -> str:
     return t
 
 # ───────────────────────────────────────────────
+# 日本語向けヒューリスティック（fallback 用）
+# ───────────────────────────────────────────────
+def _guess_ja_pos(word: str) -> str:
+    """
+    ざっくり品詞推定（辞書なし軽量）
+    戻り値: "verb" / "iadj" / "naadj" / "noun"
+    """
+    w = (word or "").strip()
+    if not w:
+        return "noun"
+    if w.endswith(("する", "します", "したい", "した", "しない", "しよう")):
+        return "verb"
+    if re.search(r"(う|く|ぐ|す|つ|ぬ|む|ぶ|る)$", w):
+        return "verb"
+    if w.endswith("い"):
+        return "iadj"
+    if w.endswith(("的", "的な", "風")):
+        return "naadj"
+    if re.fullmatch(r"[ァ-ヶー]+", w):
+        return "noun"
+    return "noun"
+
+def _ja_template_fallback(word: str) -> str:
+    kind = _guess_ja_pos(word)
+    if kind == "verb":
+        return f"{word}ところです。"
+    if kind == "iadj":
+        return f"{word}ですね。"
+    if kind == "naadj":
+        return f"{word}だね。"
+    return f"{word}が必要です。"
+
+# ───────────────────────────────────────────────
 # 語彙ユーティリティ
 # ───────────────────────────────────────────────
 def _example_temp_for(lang_code: str) -> float:
     # 日本語は特に崩れやすいのでさらに低温度
-    return 0.25 if lang_code == "ja" else EX_TEMP_DEFAULT
+    return 0.20 if lang_code == "ja" else EX_TEMP_DEFAULT
 
-def _gen_example_sentence(word: str, lang_code: str) -> str:
+def _gen_example_sentence(word: str, lang_code: str, topic: str = "") -> str:
     """
     1文だけ生成。バリデーション不合格なら最大3回まで再生成。
-    失敗時フェールセーフ（ja: 「〜を使ってみよう。」/ 他言語: Let's practice ...）
+    失敗時フェールセーフ（ja: テンプレ / 他言語: Let's practice ...）
+    テーマ（topic）を文脈ヒントとして活用。
     """
+    lang_name = LANG_NAME.get(lang_code, "English")
+    topic_hint = (topic or "").strip()
+
     system = {
         "role": "system",
         "content": (
-            "You write exactly one natural sentence. "
-            "No lists, no quotes, no emojis, no URLs."
+            "You write exactly ONE natural sentence. "
+            "No lists, no quotes, no emojis, no URLs. Keep it monolingual."
         ),
     }
-    lang_name = LANG_NAME.get(lang_code, "English")
-    user = (
-        f"Write exactly ONE short sentence in {lang_name} that uses the word: {word}. "
-        "Keep it plain and monolingual. Return ONLY the sentence."
-    )
+
+    if lang_code == "ja":
+        user = (
+            f"単語「{word}」を必ず含めて、日本語で自然な一文をちょうど1つだけ書いてください。"
+            "日常の簡単な状況を想定し、助詞の使い方を自然にしてください。"
+            "かっこ書きや翻訳注釈は不要です。"
+        )
+        if topic_hint:
+            user += f" テーマは『{topic_hint}』です。"
+    else:
+        user = (
+            f"Write exactly ONE short, natural sentence in {lang_name} that uses the word: {word}. "
+            "Imagine a simple everyday scene if helpful. Return ONLY the sentence."
+        )
+        if topic_hint:
+            user += f" Scene topic: {topic_hint}."
 
     for _ in range(3):
         try:
@@ -173,7 +221,7 @@ def _gen_example_sentence(word: str, lang_code: str) -> str:
 
     # フェールセーフ
     if lang_code == "ja":
-        return _ensure_period_for_sentence(f"{word} を使ってみよう", lang_code)
+        return _ja_template_fallback(word)
     return _ensure_period_for_sentence(f"Let's practice {word}", lang_code)
 
 def _gen_vocab_list(theme: str, lang_code: str, n: int) -> list[str]:
@@ -335,7 +383,7 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
     # 3行ブロック: 単語 → 単語 → 例文
     dialogue = []
     for w in vocab_words:
-        ex = _gen_example_sentence(w, audio_lang)
+        ex = _gen_example_sentence(w, audio_lang, topic)  # ← テーマを文脈ヒントに渡す
         dialogue.extend([("N", w), ("N", w), ("N", ex)])
 
     valid_dialogue = [(spk, line) for (spk, line) in dialogue if line.strip()]

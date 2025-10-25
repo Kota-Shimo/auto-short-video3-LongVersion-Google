@@ -417,7 +417,7 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
     valid_dialogue = [(spk, line) for (spk, line) in dialogue if line.strip()]
     audio_parts, sub_rows = [], [[] for _ in subs]
 
-    plain_lines = [line for (_, line) in valid_dialogue)]
+    plain_lines = [line for (_, line) in valid_dialogue]
     tts_lines   = []
 
     for i, (spk, line) in enumerate(valid_dialogue, 1):

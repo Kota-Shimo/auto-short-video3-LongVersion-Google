@@ -64,7 +64,7 @@ jobs:
         run: |
           python main.py AUTO \
             --privacy public \
-            --chunk 40
+            --chunk 999
 
       - name: ⤴️ Upload debug artifacts
         if: always()

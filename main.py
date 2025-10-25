@@ -34,6 +34,11 @@ GAP_MS       = int(os.getenv("GAP_MS", "120"))
 PRE_SIL_MS   = int(os.getenv("PRE_SIL_MS", "120"))
 MIN_UTTER_MS = int(os.getenv("MIN_UTTER_MS", "1000"))
 
+# ★ 日本語だけ個別に調整できるENV（未設定なら通常値を継承）
+GAP_MS_JA       = int(os.getenv("GAP_MS_JA", str(GAP_MS)))
+PRE_SIL_MS_JA   = int(os.getenv("PRE_SIL_MS_JA", str(PRE_SIL_MS)))
+MIN_UTTER_MS_JA = int(os.getenv("MIN_UTTER_MS_JA", "800"))  # デフォ軽め短縮
+
 # 生成時の温度（必要なら環境変数で上書き）
 EX_TEMP_DEFAULT = float(os.getenv("EX_TEMP", "0.35"))   # 例文
 LIST_TEMP       = float(os.getenv("LIST_TEMP", "0.30")) # 語彙リスト
@@ -412,7 +417,7 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
     valid_dialogue = [(spk, line) for (spk, line) in dialogue if line.strip()]
     audio_parts, sub_rows = [], [[] for _ in subs]
 
-    plain_lines = [line for (_, line) in valid_dialogue]
+    plain_lines = [line for (_, line) in valid_dialogue)]
     tts_lines   = []
 
     for i, (spk, line) in enumerate(valid_dialogue, 1):
@@ -421,17 +426,27 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
         tts_line = line
         if audio_lang == "ja":
             if role_idx == 2:
-                tts_line = _PARENS_JA.sub(" ", tts_line).strip()  # 例文の括弧は読まない
-            if role_idx in (0, 1) and _KANJI_ONLY.fullmatch(line):
-                yomi = _kana_reading(line)
-                if yomi:
-                    tts_line = yomi
-
-        if role_idx == 2:
-            tts_line = _ensure_period_for_sentence(tts_line, audio_lang)
+                # 例文：括弧は読まない + 必ず終止
+                tts_line = _PARENS_JA.sub(" ", tts_line).strip()
+                tts_line = _ensure_period_for_sentence(tts_line, audio_lang)
+            else:
+                # 単語行：かな読み＋句点で抑揚安定（ただし1文字語は句点を付けない）
+                if _KANJI_ONLY.fullmatch(line):
+                    yomi = _kana_reading(line)
+                    if yomi:
+                        tts_line = yomi
+                base = re.sub(r"[。！？!?]+$", "", tts_line).strip()
+                tts_line = base + "。" if len(base) >= 2 else base
+        else:
+            # 非日本語は例文のみ終止を保証
+            if role_idx == 2:
+                tts_line = _ensure_period_for_sentence(tts_line, audio_lang)
 
         out_audio = TEMP / f"{i:02d}.wav"
-        speak(audio_lang, spk, tts_line, out_audio, style="neutral")
+        # 日本語は語尾安定のため serious
+        style_for_tts = "serious" if audio_lang == "ja" else "neutral"
+
+        speak(audio_lang, spk, tts_line, out_audio, style=style_for_tts)
         audio_parts.append(out_audio)
         tts_lines.append(tts_line)
 
@@ -447,7 +462,12 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
                 sub_rows[r].append(_clean_sub_line(trans, lang))
 
     # 単純結合 → 整音 → mp3
-    new_durs = _concat_with_gaps(audio_parts, gap_ms=GAP_MS, pre_ms=PRE_SIL_MS, min_ms=MIN_UTTER_MS)
+    # ★ 日本語だけ間と最短尺を別ENVで調整
+    gap_ms = GAP_MS_JA if audio_lang == "ja" else GAP_MS
+    pre_ms = PRE_SIL_MS_JA if audio_lang == "ja" else PRE_SIL_MS
+    min_ms = MIN_UTTER_MS_JA if audio_lang == "ja" else MIN_UTTER_MS
+
+    new_durs = _concat_with_gaps(audio_parts, gap_ms=gap_ms, pre_ms=pre_ms, min_ms=min_ms)
     enhance(TEMP/"full_raw.wav", TEMP/"full.wav")
     AudioSegment.from_file(TEMP/"full.wav").export(TEMP/"full.mp3", format="mp3")
 

@@ -563,9 +563,73 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
     desc  = make_desc(theme, title_lang)
     tags  = make_tags(theme, audio_lang, subs, title_lang)
 
-    upload(video_path=final_mp4, title=title, desc=desc, tags=tags,
-           privacy=yt_privacy, account=account, thumbnail=thumb, default_lang=audio_lang)
+    # ─────────────────────────────
+    # 改良版アップロード（トークン切れ＆上限対応）
+    # ─────────────────────────────
+    def _is_limit_error(err: Exception) -> bool:
+        s = str(err)
+        return (
+            "uploadLimitExceeded" in s or
+            "quotaExceeded" in s or
+            "The user has exceeded the number of videos they may upload" in s
+        )
 
+    def _is_token_error(err: Exception) -> bool:
+        s = str(err).lower()
+        return (
+            ("token" in s and "expired" in s) or
+            ("invalid_grant" in s) or
+            ("unauthorized_client" in s) or
+            ("invalid_credentials" in s) or
+            ("401" in s)
+        )
+
+    def _try_upload_with_fallbacks() -> bool:
+        fb = os.getenv("UPLOAD_FALLBACKS", "").strip()
+        fallbacks = [x.strip() for x in fb.split(",") if x.strip()]
+        tried = []
+
+        for acc in [account] + [a for a in fallbacks if a != account]:
+            tried.append(acc)
+            try:
+                upload(
+                    video_path=final_mp4, title=title, desc=desc, tags=tags,
+                    privacy=yt_privacy, account=acc, thumbnail=thumb, default_lang=audio_lang
+                )
+                logging.info(f"[UPLOAD] ✅ success on account='{acc}'")
+                return True
+            except Exception as e:
+                # 上限エラーなら次のアカウントへ
+                if _is_limit_error(e):
+                    logging.warning(f"[UPLOAD] ⚠️ limit reached on account='{acc}' → trying next fallback.")
+                    continue
+
+                # トークン切れ（expire/revoke）なら即停止＋通知
+                if _is_token_error(e):
+                    logging.error(f"[UPLOAD] ❌ TOKEN ERROR on account='{acc}' — expired/revoked/unauthorized.")
+                    try:
+                        (TEMP / "TOKEN_EXPIRED.txt").write_text(
+                            f"Token expired or revoked for account='{acc}'.\nDetail:\n{e}",
+                            encoding="utf-8",
+                        )
+                    except Exception:
+                        pass
+                    raise SystemExit(f"[ABORT] Token expired/revoked for account='{acc}'. Please reauthorize.")
+
+                # 想定外のエラーは raise（バグ検出用）
+                logging.exception(f"[UPLOAD] unexpected error on account='{acc}'")
+                raise
+
+        # すべて上限エラー → スキップして次のコンボへ進行
+        msg = f"Upload skipped due to per-account limits. tried={tried}"
+        logging.warning("[UPLOAD] " + msg)
+        try:
+            (TEMP / "UPLOAD_SKIPPED.txt").write_text(msg, encoding="utf-8")
+        except Exception:
+            pass
+        return False
+
+    _try_upload_with_fallbacks()
 # ───────────────────────────────────────────────
 def run_all(topic, turns, privacy, do_upload, chunk_size):
     for combo in COMBOS:

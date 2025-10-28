@@ -287,6 +287,113 @@ def _gen_vocab_list(theme: str, lang_code: str, n: int) -> list[str]:
     return fallback[:n]
 
 # ───────────────────────────────────────────────
+# ★ 追加：spec 正規化＋spec対応の語彙生成（下位互換保持）
+# ───────────────────────────────────────────────
+def _normalize_spec(picked, context_hint, audio_lang, words_env_count: int):
+    """
+    topic_picker からの戻り値を正規化:
+      - dict(spec) をそのまま受け入れ、欠損は補完
+      - (theme, ctx) なら spec を薄く合成
+      - str(theme) なら既存互換の最小 spec を生成
+    返り値: (theme, context, spec)
+    """
+    if isinstance(picked, dict):
+        theme = picked.get("theme") or "general vocabulary"
+        ctx   = picked.get("context") or (context_hint or "")
+        spec  = dict(picked)  # コピー
+        if "count" not in spec or not isinstance(spec["count"], int):
+            spec["count"] = words_env_count
+        return theme, ctx, spec
+
+    if isinstance(picked, tuple) and len(picked) == 2:
+        theme, ctx = picked[0], picked[1]
+        spec = {
+            "theme": theme,
+            "context": ctx or (context_hint or ""),
+            "count": words_env_count,
+        }
+        return theme, ctx, spec
+
+    # string / その他
+    theme = str(picked)
+    ctx   = context_hint or ""
+    spec = {
+        "theme": theme,
+        "context": ctx,
+        "count": words_env_count,
+    }
+    return theme, ctx, spec
+
+def _gen_vocab_list_from_spec(spec: dict, lang_code: str) -> list[str]:
+    """
+    spec に含まれる基準（pos / relation_mode / difficulty / pattern_hint / morphology / count など）を
+    プロンプトに反映。未指定は従来挙動。
+    """
+    n   = int(spec.get("count", int(os.getenv("VOCAB_WORDS", "6"))))
+    th  = spec.get("theme") or "general vocabulary"
+    pos = spec.get("pos") or []  # ["noun","verb",...]
+    rel = (spec.get("relation_mode") or "").strip().lower()  # synonym/antonym/collocation/pattern
+    diff = (spec.get("difficulty") or "").strip().upper()    # A1/A2/B1...
+    patt = (spec.get("pattern_hint") or "").strip()
+    morph = spec.get("morphology") or []                     # ["prefix:un-","suffix:-able"]
+
+    # 既存関数の素振りを活かしつつ、条件を英語で指示（出力言語は words リストなので英語固定でOK）
+    theme_for_prompt = translate(th, lang_code) if lang_code != "en" else th
+
+    lines = []
+    lines.append(f"You are selecting {n} HIGH-FREQUENCY words for the topic: {theme_for_prompt}.")
+    if pos:
+        lines.append("Restrict part-of-speech to: " + ", ".join(pos) + ".")
+    if rel == "synonym":
+        lines.append("Prefer synonyms or near-synonyms around the central topic.")
+    elif rel == "antonym":
+        lines.append("Include at least one meaningful antonym pair if possible.")
+    elif rel == "collocation":
+        lines.append("Prefer common collocations used with the topic in everyday speech.")
+    elif rel == "pattern":
+        lines.append("Prefer short reusable patterns or set phrases.")
+    if patt:
+        lines.append(f"Pattern focus hint: {patt}.")
+    if morph:
+        lines.append("If natural, include related morphological family: " + ", ".join(morph) + ".")
+    if diff in ("A1","A2","B1"):
+        lines.append(f"Target approximate CEFR level: {diff}. Keep words short and common for this level.")
+    lines.append("Return ONLY one word or short hyphenated term per line, no numbering, no punctuation.")
+    prompt = "\n".join(lines)
+
+    content = ""
+    try:
+        rsp = GPT.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role":"user","content":prompt}],
+            temperature=LIST_TEMP,
+            top_p=0.9,
+            presence_penalty=0,
+            frequency_penalty=0,
+        )
+        content = (rsp.choices[0].message.content or "")
+    except Exception:
+        content = ""
+
+    words = []
+    for line in content.splitlines():
+        w = (line or "").strip()
+        if not w:
+            continue
+        w = re.sub(r"^\d+[\).]?\s*", "", w)     # 番号除去
+        w = re.sub(r"[，、。.!?！？]+$", "", w)  # 末尾句読点除去
+        w = w.split()[0]                        # 先頭トークン化
+        if w and w not in words:
+            words.append(w)
+
+    if len(words) >= n:
+        return words[:n]
+
+    # 不足時は従来 fallback
+    fallback = ["check-in", "reservation", "checkout", "receipt", "elevator", "lobby", "upgrade"]
+    return (words + [w for w in fallback if w not in words])[:n]
+
+# ───────────────────────────────────────────────
 # 日本語TTS用ふりがな
 # ───────────────────────────────────────────────
 _KANJI_ONLY = re.compile(r"^[一-龥々]+$")
@@ -392,7 +499,7 @@ def _concat_with_gaps(audio_paths, gap_ms=120, pre_ms=120, min_ms=1000):
 # ───────────────────────────────────────────────
 # 1コンボ処理
 # ───────────────────────────────────────────────
-def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_upload, chunk_size, context_hint=""):
+def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_upload, chunk_size, context_hint="", spec=None):
     reset_temp()
 
     raw = (topic or "").replace("\r", "\n").strip()
@@ -404,9 +511,21 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
         theme = "custom list"
         local_context = ""  # 手入力リスト時は文脈ヒントなし
     else:
-        theme = topic
-        vocab_words = _gen_vocab_list(theme, audio_lang, words_count)
-        local_context = context_hint or ""  # AUTO時に受け取った文脈を使う
+        # spec が来ていればそれを使用
+        if isinstance(spec, dict):
+            theme = spec.get("theme") or topic
+            local_context = (spec.get("context") or context_hint or "")
+            vocab_words = _gen_vocab_list_from_spec(spec, audio_lang)
+            # デバッグ: spec を保存（常にOK）
+            try:
+                (TEMP / "spec.json").write_text(json.dumps(spec, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception:
+                pass
+            # count が多すぎる場合でも既存の後段は問題なし
+        else:
+            theme = topic
+            vocab_words = _gen_vocab_list(theme, audio_lang, words_count)
+            local_context = context_hint or ""  # AUTO時に受け取った文脈を使う
 
     # 3行ブロック: 単語 → 単語 → 例文
     dialogue = []
@@ -630,6 +749,7 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
         return False
 
     _try_upload_with_fallbacks()
+
 # ───────────────────────────────────────────────
 def run_all(topic, turns, privacy, do_upload, chunk_size):
     for combo in COMBOS:
@@ -642,26 +762,27 @@ def run_all(topic, turns, privacy, do_upload, chunk_size):
         if TARGET_ONLY and account != TARGET_ONLY:
             continue
 
-        # テーマ＆文脈の決定
+        # テーマ＆文脈（＋将来の spec）決定
         picked_topic = topic
         context_hint = ""
+        spec = None
         if topic.strip().lower() == "auto":
-            # テーマと文脈ヒントを同時取得（topic_picker.py の拡張版に対応）
             try:
                 theme_ctx = pick_by_content_type("vocab", audio_lang, return_context=True)
-                if isinstance(theme_ctx, tuple) and len(theme_ctx) == 2:
-                    picked_topic, context_hint = theme_ctx
-                else:
-                    picked_topic = str(theme_ctx)
-                    context_hint = ""
+                # dict(spec) / (theme, ctx) / str のどれでもOK
+                words_count = int(os.getenv("VOCAB_WORDS", "6"))
+                theme_norm, ctx_norm, spec_norm = _normalize_spec(theme_ctx, "", audio_lang, words_count)
+                picked_topic, context_hint, spec = theme_norm, ctx_norm, spec_norm
             except TypeError:
                 # 旧シグネチャ（return_context 未対応）
                 picked_topic = pick_by_content_type("vocab", audio_lang)
                 context_hint = ""
-            logging.info(f"[{audio_lang}] picked vocab theme: {picked_topic} | ctx: {context_hint or '-'}")
+                spec = None
+
+            logging.info(f"[{audio_lang}] picked vocab theme/spec: {picked_topic} | ctx: {context_hint or '-'}")
 
         logging.info(f"=== Combo: {audio_lang}, subs={subs}, account={account}, title_lang={title_lang}, mode={CONTENT_MODE} ===")
-        run_one(picked_topic, turns, audio_lang, subs, title_lang, privacy, account, do_upload, chunk_size, context_hint=context_hint)
+        run_one(picked_topic, turns, audio_lang, subs, title_lang, privacy, account, do_upload, chunk_size, context_hint=context_hint, spec=spec)
 
 # ───────────────────────────────────────────────
 if __name__ == "__main__":

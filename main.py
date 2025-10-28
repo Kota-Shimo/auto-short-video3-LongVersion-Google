@@ -337,7 +337,6 @@ def _gen_vocab_list_from_spec(spec: dict, lang_code: str) -> list[str]:
     patt = (spec.get("pattern_hint") or "").strip()
     morph = spec.get("morphology") or []                     # ["prefix:un-","suffix:-able"]
 
-    # 既存関数の素振りを活かしつつ、条件を英語で指示（出力言語は words リストなので英語固定でOK）
     theme_for_prompt = translate(th, lang_code) if lang_code != "en" else th
 
     lines = []
@@ -765,37 +764,33 @@ def run_all(topic, turns, privacy, do_upload, chunk_size):
         # テーマ＆文脈の決定（辞書spec/タプル/文字列の全てに対応）
         picked_topic = topic
         context_hint = ""
-        extra_spec = {}  # 今後の拡張（pos/relation_mode など）を main 側で参照したくなった時用
+        spec_for_run = None  # ← 追加：run_one に確実に渡すための変数
+        words_env_count = int(os.getenv("VOCAB_WORDS", "6"))
 
         if topic.strip().lower() == "auto":
             try:
-                spec = pick_by_content_type("vocab", audio_lang, return_context=True)
-                # 1) 新仕様: dict spec
-                if isinstance(spec, dict) and "theme" in spec:
-                    picked_topic = str(spec.get("theme", "general vocabulary"))
-                    context_hint = str(spec.get("context", "") or "")
-                    extra_spec = spec  # 必要なら run_one の引数に渡す実装へ拡張可（現状は文脈のみ使用）
-
-                # 2) 旧仕様: (theme, context) タプル
-                elif isinstance(spec, tuple) and len(spec) == 2:
-                    picked_topic, context_hint = spec
-
-                # 3) 旧仕様: テーマ文字列
-                else:
-                    picked_topic = str(spec)
-                    context_hint = ""
-
+                picked_raw = pick_by_content_type("vocab", audio_lang, return_context=True)
+                # picked_raw: dict / (theme, ctx) / str のどれでもOK
+                picked_topic, context_hint, spec_for_run = _normalize_spec(
+                    picked_raw, context_hint, audio_lang, words_env_count
+                )
             except TypeError:
-                # さらに旧シグネチャ（return_context 未対応）
-                picked_topic = pick_by_content_type("vocab", audio_lang)
-                context_hint = ""
+                # 旧シグネチャ（return_context 未対応）
+                picked_raw = pick_by_content_type("vocab", audio_lang)
+                picked_topic, context_hint, spec_for_run = _normalize_spec(
+                    picked_raw, context_hint, audio_lang, words_env_count
+                )
 
             logging.info(
                 f"[{audio_lang}] picked vocab theme: {picked_topic} | ctx: {context_hint or '-'}"
             )
 
         logging.info(f"=== Combo: {audio_lang}, subs={subs}, account={account}, title_lang={title_lang}, mode={CONTENT_MODE} ===")
-        run_one(picked_topic, turns, audio_lang, subs, title_lang, privacy, account, do_upload, chunk_size, context_hint=context_hint, spec=spec)
+        run_one(
+            picked_topic, turns, audio_lang, subs, title_lang,
+            privacy, account, do_upload, chunk_size,
+            context_hint=context_hint, spec=spec_for_run
+        )
 
 # ───────────────────────────────────────────────
 if __name__ == "__main__":

@@ -22,3 +22,7 @@ combos:
   - audio: ja
     subs: [ja, id]
     account: acc6
+
+  - audio: ko
+    subs: [ko, en]
+    account: acc7

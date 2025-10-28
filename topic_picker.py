@@ -109,18 +109,8 @@ def _context_for_theme(theme: str) -> str:
     # デフォルト文脈
     return "A simple everyday situation with polite, practical language."
 
-def pick_by_content_type(content_type: str, audio_lang: str, return_context: bool = False):
-    """
-    vocab の場合に、学習本質に沿ったテーマを日替わりで1つ返す。
-    - CEFR_LEVEL（A1/A2/B1）で機能系とシーン系の比率を変更
-    - UTC日付 + audio_lang で毎日安定した結果（言語ごとに独立ローテ）
-    return_context=True の場合は (theme, context) を返す（後方互換のため既定は False）。
-    それ以外の content_type が来た場合は汎用値を返す。
-    """
-    ct = (content_type or "vocab").lower()
-    if ct != "vocab":
-        return ("general vocabulary", _context_for_theme("general vocabulary")) if return_context else "general vocabulary"
-
+def _pick_theme(audio_lang: str) -> str:
+    """CEFR_LEVEL と言語別シードでテーマを日替わり選出（従来互換）。"""
     level = os.getenv("CEFR_LEVEL", "A2").upper()
     # 日替わり安定シード（言語ごとに独立）
     today_seed = int(datetime.date.today().strftime("%Y%m%d")) + (hash(audio_lang) % 1000)
@@ -134,14 +124,86 @@ def pick_by_content_type(content_type: str, audio_lang: str, return_context: boo
     else:  # 既定 A2
         pool = (VOCAB_THEMES_FUNCTIONAL * 5) + (VOCAB_THEMES_SCENE * 5)
 
-    theme = rng.choice(pool)
-    if return_context:
-        return theme, _context_for_theme(theme)
-    return theme
+    # 任意のテーマ固定（テスト/デバッグ用）
+    override = os.getenv("THEME_OVERRIDE", "").strip()
+    if override:
+        return override
+
+    return rng.choice(pool)
+
+def _relation_mode_of_day(audio_lang: str) -> str:
+    """
+    relation_mode を日替わりで回す（synonym / antonym / collocation / pattern / ""）
+    - RELATION_MODE 環境変数があればそれを最優先
+    - RELATION_ROTATE=1 のときのみローテーション、未設定なら空文字（従来互換）
+    """
+    env = os.getenv("RELATION_MODE", "").strip().lower()
+    if env:
+        return env
+
+    if os.getenv("RELATION_ROTATE", "0") != "1":
+        return ""
+
+    modes = ["synonym", "collocation", "pattern", "antonym", ""]
+    seed = int(datetime.date.today().strftime("%Y%m%d")) + (hash(audio_lang) % 997)
+    rng = random.Random(seed)
+    return rng.choice(modes)
+
+def _parse_csv_env(name: str):
+    v = os.getenv(name, "").strip()
+    if not v:
+        return []
+    return [x.strip() for x in v.split(",") if x.strip()]
+
+def _build_spec(theme: str, audio_lang: str) -> dict:
+    """
+    環境変数で基準を上書きできる spec を構築。
+    未指定は空または日替わりデフォルト（従来互換）。
+    """
+    spec = {
+        "theme": theme,
+        "context": _context_for_theme(theme),
+        "count": int(os.getenv("VOCAB_WORDS", "6")),
+        # 任意指定可（空なら main.py 側の既定にフォールバックされる）
+        "pos": _parse_csv_env("VOCAB_POS"),  # 例: "noun,verb,adjective"
+        "relation_mode": _relation_mode_of_day(audio_lang),  # 例: synonym / antonym / collocation / pattern / ""
+        "difficulty": os.getenv("CEFR_LEVEL", "A2").upper(), # A1/A2/B1…
+        "pattern_hint": os.getenv("PATTERN_HINT", "").strip(),  # 例: "Would you like ...?"
+        "morphology": _parse_csv_env("MORPHOLOGY"),            # 例: "prefix:un-,suffix:-able"
+    }
+    return spec
+
+def pick_by_content_type(content_type: str, audio_lang: str, return_context: bool = False):
+    """
+    vocab の場合に、学習本質に沿ったテーマを日替わりで返す。
+    - CEFR_LEVEL（A1/A2/B1）で機能系とシーン系の比率を変更
+    - UTC日付 + audio_lang で毎日安定した結果（言語ごとに独立ローテ）
+    return_context=True の場合:
+        後方互換のため (theme, context) を返していたが、
+        拡張版では辞書 spec（theme/context/count/pos/relation_mode/difficulty/pattern_hint/morphology）を返す。
+        main.py 側は dict / (theme, ctx) / str の全てを受け取れる実装。
+    それ以外の content_type が来た場合は汎用値を返す。
+    """
+    ct = (content_type or "vocab").lower()
+    if ct != "vocab":
+        if return_context:
+            # 従来互換
+            theme = "general vocabulary"
+            return theme, _context_for_theme(theme)
+        return "general vocabulary"
+
+    theme = _pick_theme(audio_lang)
+
+    if not return_context:
+        # 従来互換（テーマ文字列のみ）
+        return theme
+
+    # 拡張：spec を返す（main.py が dict をそのまま扱える）
+    return _build_spec(theme, audio_lang)
 
 # ローカルテスト用
 if __name__ == "__main__":
     # 後方互換（テーマのみ）
     print(pick_by_content_type("vocab", "en"))
-    # 文脈つき
+    # 文脈つき（拡張 spec）
     print(pick_by_content_type("vocab", "en", return_context=True))

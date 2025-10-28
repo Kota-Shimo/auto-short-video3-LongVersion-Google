@@ -6,6 +6,7 @@ main.py – VOCAB専用版（単純結合＋日本語ふりがな[TTSのみ]＋�
 - 追加: TARGET_ACCOUNT/--account で combos をアカウント単位に絞り込み可能。
 - 追加: topic_picker の文脈ヒント（context）を例文生成に渡して日本語崩れを抑制。
 - 追加: ラングエージルール（厳密モノリンガル・記号/注釈禁止）を例文生成に統合。
+- 追加: 単語2行の字幕は「例文＋テーマ＋品詞ヒント」で1語に確定する文脈訳へ切替。
 """
 
 import argparse, logging, re, json, subprocess, os
@@ -138,10 +139,10 @@ def _lang_rules(lang_code: str) -> str:
         )
     lang_name = LANG_NAME.get(lang_code, "English")
     return (
-        f"Write entirely in {lang_name}. "
-        "Do not code-switch or include other writing systems. "
-        "Avoid ASCII symbols like '/', '-', '→', '()', '[]', '<>', and '|'. "
-        "No translation glosses, brackets, or country/language mentions."
+            f"Write entirely in {lang_name}. "
+            "Do not code-switch or include other writing systems. "
+            "Avoid ASCII symbols like '/', '-', '→', '()", '[]', '<>', and '|'. "
+            "No translation glosses, brackets, or country/language mentions."
     )
 
 # ───────────────────────────────────────────────
@@ -420,6 +421,60 @@ def _kana_reading(word: str) -> str:
         return ""
 
 # ───────────────────────────────────────────────
+# 例文取得（同じ3行ブロックの3行目）
+# ───────────────────────────────────────────────
+def _example_for_index(valid_dialogue: list[tuple[str, str]], idx0: int) -> str:
+    """
+    valid_dialogue は 3行1組（[word, word, example]）で並ぶ。
+    idx0 がその組の 0/1/2 のいずれでも、例文は常に +2 の位置。
+    """
+    role_idx = idx0 % 3  # 0/1/2
+    base = idx0 - role_idx
+    ex_pos = base + 2
+    if 0 <= ex_pos < len(valid_dialogue):
+        return valid_dialogue[ex_pos][1]
+    return ""
+
+# ───────────────────────────────────────────────
+# 単語専用・文脈つき翻訳（1語だけ返す）
+# ───────────────────────────────────────────────
+def translate_word_context(word: str, target_lang: str, src_lang: str, theme: str, example: str, pos_hint: str | None = None) -> str:
+    """
+    単語の意味を 例文＋テーマ＋品詞ヒント で確定し、target_lang の“1語のみ”を返す。
+    """
+    theme = (theme or "").strip()
+    example = (example or "").strip()
+    pos_line = f"Part of speech hint: {pos_hint}." if pos_hint else ""
+
+    prompt_lines = [
+        "You are a precise bilingual lexicon generator.",
+        f"Source language code: {src_lang}",
+        f"Target language code: {target_lang}",
+        "Task: Translate the SINGLE WORD below into exactly ONE natural target-language word that matches the intended meaning in the given context.",
+        "Rules:",
+        "- Output ONLY one word, no punctuation, no quotes, no explanations.",
+        "- Choose the sense that fits the context (theme and example sentence).",
+        "- Avoid month-name or book-title senses unless clearly indicated by context.",
+        pos_line,
+        "",
+        f"Word: {word}",
+        f"Theme: {theme}" if theme else "Theme: (none)",
+        f"Example sentence for context: {example}" if example else "Example sentence for context: (none)",
+    ]
+    try:
+        rsp = GPT.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role":"user","content":"\n".join(prompt_lines)}],
+            temperature=0.0, top_p=1.0
+        )
+        out = (rsp.choices[0].message.content or "").strip()
+        out = re.sub(r"[，、。.!?！？]+$", "", out).strip()
+        out = out.split()[0] if out else ""
+        return out or word
+    except Exception:
+        return word
+
+# ───────────────────────────────────────────────
 # メタ生成（タイトル言語に統一）
 # ───────────────────────────────────────────────
 def make_title(theme, title_lang: str, audio_lang_for_label: str | None = None):
@@ -520,7 +575,6 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
                 (TEMP / "spec.json").write_text(json.dumps(spec, ensure_ascii=False, indent=2), encoding="utf-8")
             except Exception:
                 pass
-            # count が多すぎる場合でも既存の後段は問題なし
         else:
             theme = topic
             vocab_words = _gen_vocab_list(theme, audio_lang, words_count)
@@ -574,7 +628,24 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
                 sub_rows[r].append(_clean_sub_line(line, lang))
             else:
                 try:
-                    trans = translate(line, lang)
+                    if role_idx in (0, 1):  # 単語2行は文脈つき1語訳
+                        example_ctx = _example_for_index(valid_dialogue, i-1)
+                        # POSヒント：spec優先→日本語のみ簡易推定
+                        pos_hint = None
+                        if isinstance(spec, dict) and spec.get("pos"):
+                            pos_hint = ",".join(spec["pos"])
+                        elif audio_lang == "ja":
+                            _k = _guess_ja_pos(line)
+                            pos_map = {"verb":"verb", "iadj":"adjective", "naadj":"adjective", "noun":"noun"}
+                            pos_hint = pos_map.get(_k, None)
+
+                        trans = translate_word_context(
+                            word=line, target_lang=lang, src_lang=audio_lang,
+                            theme=theme, example=example_ctx, pos_hint=pos_hint
+                        )
+                    else:
+                        # 例文行は従来どおり文翻訳
+                        trans = translate(line, lang)
                 except Exception:
                     trans = line
                 sub_rows[r].append(_clean_sub_line(trans, lang))
@@ -593,13 +664,10 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
     bg_png = TEMP / "bg.png"
 
     try:
-        # 日本語テーマを英語化（例：「朝食」→ "breakfast"）
-        theme_en = translate(theme, "en")
+        theme_en = translate(theme, "en")  # 日本語テーマを英語化
     except Exception:
         theme_en = theme
 
-    # first_word（単語リストの最初）も一応使うが、
-    # 日本語など非ASCIIなら英語テーマ優先
     first_word = valid_dialogue[0][1] if valid_dialogue else theme
 
     def _is_ascii(s: str) -> bool:
@@ -609,7 +677,7 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
         except Exception:
             return False
 
-    # 検索に使うキーワードを決定
+    # 検索クエリ
     if not _is_ascii(first_word or ""):
         query_for_bg = theme_en or "language learning"
     else:
@@ -764,13 +832,12 @@ def run_all(topic, turns, privacy, do_upload, chunk_size):
         # テーマ＆文脈の決定（辞書spec/タプル/文字列の全てに対応）
         picked_topic = topic
         context_hint = ""
-        spec_for_run = None  # ← 追加：run_one に確実に渡すための変数
+        spec_for_run = None
         words_env_count = int(os.getenv("VOCAB_WORDS", "6"))
 
         if topic.strip().lower() == "auto":
             try:
                 picked_raw = pick_by_content_type("vocab", audio_lang, return_context=True)
-                # picked_raw: dict / (theme, ctx) / str のどれでもOK
                 picked_topic, context_hint, spec_for_run = _normalize_spec(
                     picked_raw, context_hint, audio_lang, words_env_count
                 )

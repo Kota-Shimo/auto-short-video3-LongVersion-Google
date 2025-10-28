@@ -1,4 +1,4 @@
-# topic_picker.py – vocab専用のテーマを日替わりで返す（CEFR重み付き・学習本質寄り + 拡張spec）
+# topic_picker.py – vocab専用のテーマをランダム返却（CEFR重み付き・学習本質寄り + 拡張spec）
 import os
 import random
 import datetime
@@ -110,11 +110,8 @@ def _context_for_theme(theme: str) -> str:
     return "A simple everyday situation with polite, practical language."
 
 def _pick_theme(audio_lang: str) -> str:
-    """CEFR_LEVEL と言語別シードでテーマを日替わり選出（従来互換）。"""
+    """CEFR_LEVEL を考慮しつつ、毎回ランダム選出（実行ごとに変化）。"""
     level = os.getenv("CEFR_LEVEL", "A2").upper()
-    # 日替わり安定シード（言語ごとに独立）
-    today_seed = int(datetime.date.today().strftime("%Y%m%d")) + (hash(audio_lang) % 1000)
-    rng = random.Random(today_seed)
 
     # 学習段階に応じた重み付け
     if level == "A1":
@@ -129,25 +126,20 @@ def _pick_theme(audio_lang: str) -> str:
     if override:
         return override
 
-    return rng.choice(pool)
+    # 実行ごとにランダム
+    return random.choice(pool)
 
 def _relation_mode_of_day(audio_lang: str) -> str:
     """
-    relation_mode を日替わりで回す（synonym / antonym / collocation / pattern / ""）
+    relation_mode を毎回ランダムに選択（synonym / antonym / collocation / pattern / ""）
     - RELATION_MODE 環境変数があればそれを最優先
-    - RELATION_ROTATE=1 のときのみローテーション、未設定なら空文字（従来互換）
     """
     env = os.getenv("RELATION_MODE", "").strip().lower()
     if env:
         return env
 
-    if os.getenv("RELATION_ROTATE", "0") != "1":
-        return ""
-
     modes = ["synonym", "collocation", "pattern", "antonym", ""]
-    seed = int(datetime.date.today().strftime("%Y%m%d")) + (hash(audio_lang) % 997)
-    rng = random.Random(seed)
-    return rng.choice(modes)
+    return random.choice(modes)
 
 def _parse_csv_env(name: str):
     v = os.getenv(name, "").strip()
@@ -177,7 +169,7 @@ def pick_by_content_type(content_type: str, audio_lang: str, return_context: boo
     """
     vocab の場合に、学習本質に沿ったテーマを返す。
     - CEFR_LEVEL（A1/A2/B1）で機能系とシーン系の比率を変更
-    - UTC日付 + audio_lang で毎日安定（言語ごとに独立ローテ）
+    - 実行ごとにランダム（言語ごと固定シードは廃止）
 
     return_context=False:  従来互換 → テーマ文字列を返す
     return_context=True:   拡張     → 辞書specを返す（theme/context/count/pos/relation_mode/difficulty/pattern_hint/morphology）
@@ -188,7 +180,6 @@ def pick_by_content_type(content_type: str, audio_lang: str, return_context: boo
     if ct != "vocab":
         if return_context:
             theme = "general vocabulary"
-            # 後方互換のため (theme, context) を返していたが、main 側で dict も扱えるため dict で返す
             return {
                 "theme": theme,
                 "context": _context_for_theme(theme),

@@ -190,7 +190,7 @@ def _lang_rules(lang_code: str) -> str:
         return (
             "Write entirely in Japanese. "
             "Do not include Latin letters or other languages. "
-            "Avoid ASCII symbols such as '/', '-', '→', '()", '[]', '<>', and '|'. "
+            "Avoid ASCII symbols such as '/', '-', '→', '()', '[]', '<>', and '|'. "
             "No translation glosses, brackets, or country/language mentions."
         )
     lang_name = LANG_NAME.get(lang_code, "English")

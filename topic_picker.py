@@ -1,7 +1,6 @@
 # topic_picker.py – vocab専用のテーマをランダム返却（CEFR重み付き・学習本質寄り + 拡張spec）
 import os
 import random
-import datetime
 
 # ==== vocab 用の最適化テーマ ====
 # 機能別（Functional）：伝えたいことが言える中核スキル
@@ -126,8 +125,9 @@ def _pick_theme(audio_lang: str) -> str:
     if override:
         return override
 
-    # 実行ごとにランダム
-    return random.choice(pool)
+    # 実行ごとにランダム（暗号学的PRNGで揺らぎを強める）
+    rng = random.SystemRandom()
+    return rng.choice(pool)
 
 def _relation_mode_of_day(audio_lang: str) -> str:
     """
@@ -138,8 +138,9 @@ def _relation_mode_of_day(audio_lang: str) -> str:
     if env:
         return env
 
+    rng = random.SystemRandom()
     modes = ["synonym", "collocation", "pattern", "antonym", ""]
-    return random.choice(modes)
+    return rng.choice(modes)
 
 def _parse_csv_env(name: str):
     v = os.getenv(name, "").strip()
@@ -150,7 +151,7 @@ def _parse_csv_env(name: str):
 def _build_spec(theme: str, audio_lang: str) -> dict:
     """
     環境変数で基準を上書きできる spec を構築。
-    未指定は空または日替わりデフォルト（従来互換）。
+    未指定は空またはデフォルト（従来互換）。
     """
     spec = {
         "theme": theme,

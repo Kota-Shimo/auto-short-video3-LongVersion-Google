@@ -9,7 +9,7 @@ main.py – VOCAB専用版（単純結合＋日本語ふりがな[TTSのみ]＋�
 - 追加: 単語2行の字幕は「例文＋テーマ＋品詞ヒント」で1語に確定する文脈訳へ切替。
 """
 
-import argparse, logging, re, json, subprocess, os
+import argparse, logging, re, json, subprocess, os, sys  # ← sys を追加
 from datetime import datetime
 from pathlib import Path
 from shutil import rmtree
@@ -819,45 +819,69 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
 
 # ───────────────────────────────────────────────
 def run_all(topic, turns, privacy, do_upload, chunk_size):
-    for combo in COMBOS:
-        audio_lang  = combo["audio"]
-        subs        = combo["subs"]
-        account     = combo.get("account","default")
-        title_lang  = _infer_title_lang(audio_lang, subs, combo)
+    """
+    親プロセス: 各 account ごとに子プロセスを起動（ISOLATED_RUN=1 を付与）
+    子プロセス(ISOLATED_RUN=1): そのまま run_one を実行（再帰起動しない）
+    """
+    isolated = os.getenv("ISOLATED_RUN", "0") == "1"
 
-        # Account 絞り込み（__main__ で COMBOS をフィルタ済みだが二重保険）
+    if isolated:
+        # ここは子プロセス用：従来通りに実行（TARGET_ONLY があれば 1 アカウントのみになる）
+        for combo in COMBOS:
+            audio_lang  = combo["audio"]
+            subs        = combo["subs"]
+            account     = combo.get("account","default")
+            title_lang  = _infer_title_lang(audio_lang, subs, combo)
+
+            if TARGET_ONLY and account != TARGET_ONLY:
+                continue
+
+            picked_topic = topic
+            context_hint = ""
+            spec_for_run = None
+            words_env_count = int(os.getenv("VOCAB_WORDS", "6"))
+
+            if topic.strip().lower() == "auto":
+                try:
+                    picked_raw = pick_by_content_type("vocab", audio_lang, return_context=True)
+                    picked_topic, context_hint, spec_for_run = _normalize_spec(
+                        picked_raw, context_hint, audio_lang, words_env_count
+                    )
+                except TypeError:
+                    picked_raw = pick_by_content_type("vocab", audio_lang)
+                    picked_topic, context_hint, spec_for_run = _normalize_spec(
+                        picked_raw, context_hint, audio_lang, words_env_count
+                    )
+
+            logging.info(f"[ISOLATED] {audio_lang} | subs={subs} | account={account} | theme={picked_topic}")
+            run_one(
+                picked_topic, turns, audio_lang, subs, title_lang,
+                privacy, account, do_upload, chunk_size,
+                context_hint=context_hint, spec=spec_for_run
+            )
+        return
+
+    # ここは親プロセス：各アカウントごとに子プロセスで独立実行
+    for combo in COMBOS:
+        account = combo.get("account", "default")
         if TARGET_ONLY and account != TARGET_ONLY:
             continue
 
-        # テーマ＆文脈の決定（辞書spec/タプル/文字列の全てに対応）
-        picked_topic = topic
-        context_hint = ""
-        spec_for_run = None
-        words_env_count = int(os.getenv("VOCAB_WORDS", "6"))
+        cmd = [
+            sys.executable, str(BASE / "main.py"),
+            topic,
+            "--privacy", privacy,
+            "--chunk", str(chunk_size),
+            "--account", account,
+        ]
+        if not do_upload:
+            cmd.append("--no-upload")
 
-        if topic.strip().lower() == "auto":
-            try:
-                picked_raw = pick_by_content_type("vocab", audio_lang, return_context=True)
-                picked_topic, context_hint, spec_for_run = _normalize_spec(
-                    picked_raw, context_hint, audio_lang, words_env_count
-                )
-            except TypeError:
-                # 旧シグネチャ（return_context 未対応）
-                picked_raw = pick_by_content_type("vocab", audio_lang)
-                picked_topic, context_hint, spec_for_run = _normalize_spec(
-                    picked_raw, context_hint, audio_lang, words_env_count
-                )
+        env = os.environ.copy()
+        env["ISOLATED_RUN"] = "1"   # ← 子プロセス側で再帰起動を止めるためのフラグ
 
-            logging.info(
-                f"[{audio_lang}] picked vocab theme: {picked_topic} | ctx: {context_hint or '-'}"
-            )
-
-        logging.info(f"=== Combo: {audio_lang}, subs={subs}, account={account}, title_lang={title_lang}, mode={CONTENT_MODE} ===")
-        run_one(
-            picked_topic, turns, audio_lang, subs, title_lang,
-            privacy, account, do_upload, chunk_size,
-            context_hint=context_hint, spec=spec_for_run
-        )
+        logging.info(f"▶ Spawning isolated run for account={account}: {' '.join(cmd)}")
+        subprocess.run(cmd, check=False, env=env)
 
 # ───────────────────────────────────────────────
 if __name__ == "__main__":

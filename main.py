@@ -548,71 +548,162 @@ def translate_word_context(word: str, target_lang: str, src_lang: str, theme: st
     except Exception:
         return word
 
-# ───────────────────────────────────────────────
-# メタ生成（タイトル言語に統一）
-# ───────────────────────────────────────────────
-# ───────────────────────────────────────────────
-# メタ生成（タイトル言語に統一 + POS/Difficulty対応 + LLM補強）
-# ───────────────────────────────────────────────
 def make_title(theme, title_lang: str, audio_lang_for_label: str | None = None,
                pos: list[str] | None = None,
                difficulty: str | None = None,
                pattern_hint: str | None = None):
+    
+# ───────────────────────────────────────────────
     """
-    YouTube向けタイトル生成（安全フォールバック付き）
-    - 品詞(pos), 難易度(difficulty), pattern_hintを含む
-    - LLMが失敗しても既存タイトルに確実フォールバック
+    YouTube向けタイトル生成（多言語対応・安全フォールバック付き）
+    - 品詞(pos), 難易度(difficulty), pattern_hintを反映
+    - title_lang に合わせてプロンプト/長さ/例文を切替
     """
-
-    # 安全フォールバック関数
+# ───────────────────────────────────────────────
     def _fallback_title():
+        # タイトル言語へテーマを翻訳（英語ならそのまま）
         try:
             theme_local = theme if title_lang == "en" else translate(theme, title_lang)
         except Exception:
             theme_local = theme
 
-        cefr = difficulty or "A2"
+        cefr = (difficulty or "A2").upper()
         pos_tag = ""
         if pos and isinstance(pos, list) and len(pos) == 1:
-            pos_tag = f"[{pos[0]}]"
+            pos_tag = f"[{pos[0]}] "
+
+        # 言語別の最小フォールバック
         if title_lang == "ja":
-            base = f"{theme_local}で使える英語（{cefr}）"
-            if pos_tag:
-                base = f"{pos_tag} {base}"
             label = JP_CONV_LABEL.get(audio_lang_for_label or "", "")
-            t = f"{label} {base}" if label and label not in base else base
-            return sanitize_title(t)[:35]
-        else:
-            t = f"{theme_local.capitalize()} vocab ({cefr})"
-            return sanitize_title(t)[:70]
+            base = f"{theme_local}で使える英語（{cefr}）"
+            t = f"{pos_tag}{base}"
+            if label and label not in t:
+                t = f"{label} {t}"
+            return sanitize_title(t)[:40]
 
-    # LLMを使ったタイトル生成
+        # 主要言語の軽量フォールバック
+        fallback_templates = {
+            "en": f"{pos_tag}{theme_local.capitalize()} vocab ({cefr})",
+            "pt": f"{pos_tag}Vocabulário de {theme_local} ({cefr})",
+            "es": f"{pos_tag}Vocabulario de {theme_local} ({cefr})",
+            "fr": f"{pos_tag}Vocabulaire : {theme_local} ({cefr})",
+            "id": f"{pos_tag}Kosakata {theme_local} ({cefr})",
+            "ko": f"{pos_tag}{theme_local} 필수 어휘 ({cefr})",
+        }
+        t = fallback_templates.get(title_lang, f"{pos_tag}{theme_local} ({cefr})")
+        return sanitize_title(t)[:70]
+
+    # ---- 言語別ルールと例（LLM用）----
+    max_len = 40 if title_lang == "ja" else 70
+    cefr = (difficulty or "A2").upper()
+    pos_str = ", ".join(pos) if pos else ""
+    pattern = pattern_hint or ""
+
     try:
-        pos_str = ", ".join(pos) if pos else ""
-        cefr = difficulty or "A2"
-        pattern = pattern_hint or ""
-        theme_local = translate(theme, "ja") if title_lang == "ja" else theme
+        # タイトル言語へテーマを翻訳（日本語以外も対応）
+        theme_local = theme if title_lang == "en" else translate(theme, title_lang)
+    except Exception:
+        theme_local = theme
 
-        rules = (
-            "You are a YouTube title creator for English-learning short videos. "
-            "Write ONE concise, clickable Japanese title under 40 characters. "
-            "Avoid emojis, quotes, or extra punctuation. "
-            "Reflect the topic naturally (not literal translation)."
-        )
+    lang_rules = {
+        "ja": {
+            "rule": (
+                "You are a YouTube title creator for language-learning Shorts. "
+                "Write ONE concise, clickable Japanese title under 40 characters. "
+                "Avoid emojis, quotes, and extra punctuation. Keep it natural."
+            ),
+            "examples": [
+                "ホテルチェックインで使える英語（A2）",
+                "職場でよく使う英語フレーズ（B1）",
+                "旅行で役立つ動詞マスター（A2）",
+            ],
+        },
+        "en": {
+            "rule": (
+                "You are a YouTube title creator for language-learning Shorts. "
+                "Write ONE concise, clickable English title under 70 characters. "
+                "Avoid emojis, quotes, and extra punctuation. Keep it natural."
+            ),
+            "examples": [
+                "Essential hotel check-in phrases (A2)",
+                "Workplace verbs you’ll actually use (B1)",
+                "Travel phrases made easy (A2)",
+            ],
+        },
+        "pt": {
+            "rule": (
+                "Crie UM título curto e clicável em português (até 70 caracteres) "
+                "para um Short de aprendizado de idiomas. Sem emojis, aspas ou pontuação extra."
+            ),
+            "examples": [
+                "Frases essenciais para check-in no hotel (A2)",
+                "Verbos úteis no trabalho (B1)",
+                "Expressões de viagem fáceis (A2)",
+            ],
+        },
+        "es": {
+            "rule": (
+                "Escribe UN título breve y atractivo en español (máx. 70 caracteres) "
+                "para un Short de aprendizaje de idiomas. Sin emojis ni comillas."
+            ),
+            "examples": [
+                "Frases clave para el check-in del hotel (A2)",
+                "Verbos útiles en el trabajo (B1)",
+                "Expresiones fáciles para viajar (A2)",
+            ],
+        },
+        "fr": {
+            "rule": (
+                "Rédigez UN titre court et percutant en français (70 caractères max) "
+                "pour un Short d'apprentissage des langues. Pas d’emojis ni de guillemets."
+            ),
+            "examples": [
+                "Phrases clés pour l’enregistrement à l’hôtel (A2)",
+                "Verbes utiles au travail (B1)",
+                "Expressions de voyage faciles (A2)",
+            ],
+        },
+        "id": {
+            "rule": (
+                "Tulis SATU judul pendek dan menarik dalam bahasa Indonesia (maks 70 karakter) "
+                "untuk Shorts pembelajaran bahasa. Tanpa emoji atau kutip."
+            ),
+            "examples": [
+                "Frasa penting untuk check-in hotel (A2)",
+                "Verba berguna di tempat kerja (B1)",
+                "Ekspresi mudah untuk perjalanan (A2)",
+            ],
+        },
+        "ko": {
+            "rule": (
+                "언어 학습 쇼츠용 한국어 제목을 하나만 작성하세요(70자 이내). "
+                "이모지, 따옴표, 과한 구두점은 사용하지 마세요."
+            ),
+            "examples": [
+                "호텔 체크인 필수 표현 (A2)",
+                "직장에서 자주 쓰는 동사 (B1)",
+                "여행에 유용한 표현 (A2)",
+            ],
+        },
+    }
 
+    rules = lang_rules.get(title_lang, lang_rules["en"])
+    examples_block = "\n".join(rules["examples"])
+
+    # ---- LLM 生成（失敗時はフォールバック）----
+    try:
+        from openai import OpenAI
+        client = OpenAI()
         prompt = (
-            f"{rules}\n\n"
-            f"Theme: {theme_local}\n"
-            f"Part of speech: {pos_str}\n"
+            f"{rules['rule']}\n\n"
+            f"Topic: {theme_local}\n"
             f"Difficulty: {cefr}\n"
-            f"Pattern: {pattern}\n\n"
-            "Examples:\n"
-            "ホテルチェックインで使える英語（A2）\n"
-            "理由を丁寧に伝える英語フレーズ（B1）\n"
-            "動詞を中心に覚える！職場で使える英語（B1）"
+            f"Part of speech (optional): {pos_str or '—'}\n"
+            f"Pattern hint (optional): {pattern or '—'}\n\n"
+            f"Examples:\n{examples_block}\n\n"
+            "Return ONLY the title text."
         )
-
-        rsp = GPT.chat.completions.create(
+        rsp = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
@@ -622,8 +713,14 @@ def make_title(theme, title_lang: str, audio_lang_for_label: str | None = None,
         title = sanitize_title(out)
         if not title or len(title) < 4:
             return _fallback_title()
-        # ここで最終強制トリム（言語別の目標幅）
-        return title[:40] if (title_lang == "ja") else title[:70]
+
+        # 日本語のみ会話ラベル付与（重複防止）
+        if title_lang == "ja":
+            label = JP_CONV_LABEL.get(audio_lang_for_label or "", "")
+            if label and label not in title:
+                title = f"{label} {title}"
+
+        return title[:max_len]
     except Exception:
         return _fallback_title()
 

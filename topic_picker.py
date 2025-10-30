@@ -27,7 +27,7 @@ VOCAB_THEMES_SCENE = [
 def _context_for_theme(theme: str) -> str:
     """
     例文生成の安定化用に、テーマに合う超短いシーン文脈を英語で返す。
-    （モデルへの指示用なので英語固定／出力言語は別で指定される想定）
+    （モデルへの指示用なので英語固定／出力言語は別で指定）
     """
     t = (theme or "").lower()
 
@@ -117,6 +117,8 @@ def _pick_theme(audio_lang: str) -> str:
         pool = (VOCAB_THEMES_FUNCTIONAL * 7) + (VOCAB_THEMES_SCENE * 3)
     elif level == "B1":
         pool = (VOCAB_THEMES_FUNCTIONAL * 4) + (VOCAB_THEMES_SCENE * 6)
+    elif level == "B2":
+        pool = (VOCAB_THEMES_FUNCTIONAL * 6) + (VOCAB_THEMES_SCENE * 4)
     else:  # 既定 A2
         pool = (VOCAB_THEMES_FUNCTIONAL * 5) + (VOCAB_THEMES_SCENE * 5)
 
@@ -149,35 +151,40 @@ def _parse_csv_env(name: str):
 
 # === ランダム選択ヘルパ ===
 def _random_pos():
-    """環境変数 VOCAB_POS が未指定の場合のみ、単一品詞 or 指定なしをランダム選択。"""
+    """ENV未指定なら、単一品詞 or 指定なしをランダム選択（後方互換：ENV指定があればそれを優先）。"""
     env = _parse_csv_env("VOCAB_POS")
     if env:
-        return env  # 既存互換：明示指定を尊重
+        return env
     rng = random.SystemRandom()
     return rng.choice([[], ["noun"], ["verb"], ["adjective"]])
 
 def _random_difficulty():
-    """環境変数 CEFR_LEVEL が未指定の場合のみ、A1/A2/B1 をランダム選択。"""
+    """
+    ENV未指定なら A2/B1/B2 からランダム。
+    少し“背伸び語彙”を混ぜたいので A1 はデフォルト抽選から外す（ENV指定でA1固定は可）。
+    """
     env = os.getenv("CEFR_LEVEL", "").strip().upper()
-    if env in ("A1", "A2", "B1"):
+    if env in ("A1", "A2", "B1", "B2"):
         return env
     rng = random.SystemRandom()
-    return rng.choice(["A1", "A2", "B1"])
+    return rng.choice(["A2", "B1", "B2"])
 
 def _random_pattern_hint():
-    """環境変数 PATTERN_HINT が未指定の場合のみ、パターン意図をランダム選択（空も混ぜる）。"""
+    """ENV未指定なら、汎用パターン意図をランダム選択（空も混ぜてバリエーション確保）。"""
     env = os.getenv("PATTERN_HINT", "").strip()
     if env:
         return env
     rng = random.SystemRandom()
     pool = [
-        "",  # 指定なし（バリエーション確保）
-        "polite_request",
-        "ask_availability",
-        "confirm_detail",
-        "make_suggestion",
-        "give_advice",
-        "express_opinion",
+        "",  # 指定なし
+        "polite_request",      # please / could / would
+        "ask_permission",      # may I / can I
+        "ask_availability",    # available / time / slot
+        "confirm_detail",      # confirm / double-check
+        "make_suggestion",     # would like / maybe / how about
+        "give_advice",         # should / recommend / better to
+        "express_opinion",     # I think / I prefer
+        "express_consequence", # therefore / so / accordingly
     ]
     return rng.choice(pool)
 
@@ -185,7 +192,7 @@ def _build_spec(theme: str, audio_lang: str) -> dict:
     """
     spec を構築（ENV最優先・未指定はランダム）:
     - pos: [], ["noun"], ["verb"], ["adjective"] のいずれか
-    - difficulty: A1/A2/B1 のいずれか
+    - difficulty: A2/B1/B2 のいずれか（ENVでA1〜B2指定可）
     - pattern_hint: 上記パターンのいずれか（空含む）
     """
     spec = {
@@ -196,14 +203,14 @@ def _build_spec(theme: str, audio_lang: str) -> dict:
         "relation_mode": _relation_mode_of_day(audio_lang),
         "difficulty": _random_difficulty(),
         "pattern_hint": _random_pattern_hint(),
-        "morphology": _parse_csv_env("MORPHOLOGY"),  # 既存互換：必要ならENVで
+        "morphology": _parse_csv_env("MORPHOLOGY"),  # 既存互換：必要ならENVで指定
     }
     return spec
 
 def pick_by_content_type(content_type: str, audio_lang: str, return_context: bool = False):
     """
     vocab の場合に、学習本質に沿ったテーマと spec を返す。
-    - CEFR_LEVEL（A1/A2/B1）で機能系とシーン系の比率を変更（テーマ選択）
+    - CEFR_LEVEL（A1/A2/B1/B2）で機能系とシーン系の比率を変更（テーマ選択）
     - pos/difficulty/pattern_hint は ENV 未指定ならランダムで決定
 
     return_context=False:  従来互換 → テーマ文字列を返す

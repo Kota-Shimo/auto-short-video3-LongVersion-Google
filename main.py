@@ -324,6 +324,9 @@ def _gen_vocab_list(theme: str, lang_code: str, n: int) -> list[str]:
         f"List {n} essential single or hyphenated words for {theme_for_prompt} context "
         f"in {LANG_NAME.get(lang_code,'English')}. Return ONLY one word per line, no numbering."
     )
+    # ★ 追加：出力言語を強制
+    prompt += f"\nAll words must be written in {LANG_NAME.get(lang_code,'the target')} language."
+
     content = ""
     try:
         rsp = GPT.chat.completions.create(
@@ -426,6 +429,8 @@ def _gen_vocab_list_from_spec(spec: dict, lang_code: str) -> list[str]:
     if diff in ("A1","A2","B1"):
         lines.append(f"Target approximate CEFR level: {diff}. Keep words short and common for this level.")
     lines.append("Return ONLY one word or short hyphenated term per line, no numbering, no punctuation.")
+    # ★ 追加：出力言語を強制
+    lines.append(f"All words must be written in {LANG_NAME.get(lang_code,'the target')} language.")
     prompt = "\n".join(lines)
 
     content = ""
@@ -520,6 +525,8 @@ def translate_word_context(word: str, target_lang: str, src_lang: str, theme: st
         "Task: Translate the SINGLE WORD below into exactly ONE natural target-language word that matches the intended meaning in the given context.",
         "Rules:",
         "- Output ONLY one word, no punctuation, no quotes, no explanations.",
+        "- The output must be written entirely in the target language.",
+        f"- Return ONLY one word in {LANG_NAME.get(target_lang,'target language')} language.",
         "- Choose the sense that fits the context (theme and example sentence).",
         "- Avoid month-name or book-title senses unless clearly indicated by context.",
         pos_line,

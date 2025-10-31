@@ -573,78 +573,78 @@ def _gen_more_words_excluding(theme_for_prompt: str, lang_code: str, need: int, 
 
 def _gen_vocab_list(theme: str, lang_code: str, n: int) -> list[str]:
     """
-    汎用：強プロンプト → 厳密パース → 不足分だけ再生成 → 最後にフォールバック。
+    改良版:
+      - GPTが空返しや英字混入を起こさないようプロンプトを明確化
+      - リトライ最大5回、間隔1秒
+      - 3回失敗したら上位モデル(gpt-4o)で再実行
+      - ログ出力で原因追跡
+      - 出力が空の場合も「自然語＋多言語対応フォールバック」
     """
+    import time, random
     theme_for_prompt = translate(theme, lang_code) if lang_code != "en" else theme
-    lang_name = LANG_NAME.get(lang_code, "the target language")
-    banned = _banned_for(lang_code)
 
-    base_prompt = (
-        f"List {n} HIGH-FREQUENCY words for the topic: {theme_for_prompt}.\n"
-        f"Language: {lang_name}. Return ONLY one word per line, no numbering.\n"
-        "No explanations. No examples. No punctuation."
-        + ("\nUse ONLY the target script (no Latin letters)." if lang_code in ("ko","ja","zh") else "")
-        + ("\nAvoid over-generic hotel words such as check-in / reservation equivalents.")
+    prompt = (
+        f"List exactly {n} essential, real, single words commonly used in the topic: {theme_for_prompt}. "
+        "Write only one word per line. No numbering, no punctuation, no explanations.\n"
+        "All words must be natural and commonly used by native speakers. "
+        "If the language uses non-Latin characters (e.g., Japanese, Korean, Chinese), use native script only. "
+        "If transliteration exists, prefer native writing. Output only the list."
     )
 
     content = ""
-    for attempt in range(3):
+    for attempt in range(5):
         try:
+            model_name = "gpt-4o-mini" if attempt < 3 else "gpt-4o"
             rsp = GPT.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": base_prompt}],
-                temperature=LIST_TEMP + 0.05 * attempt,
+                model=model_name,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.4,
                 top_p=0.9,
             )
-            content = (rsp.choices[0].message.content or "")
+            content = (rsp.choices[0].message.content or "").strip()
+            if content:
+                break
+        except Exception as e:
+            print(f"[WARN] vocab generation failed ({lang_code}, try {attempt+1}/5): {e}")
+        time.sleep(1)
+
+    # 二段階再試行（完全空のとき）
+    if not content.strip():
+        try:
+            print(f"[INFO] second-phase retry for {lang_code}")
+            rsp = GPT.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": prompt + "\nRepeat your answer clearly."}],
+                temperature=0.5,
+            )
+            content = (rsp.choices[0].message.content or "").strip()
         except Exception:
             content = ""
-        if content and content.strip():
-            break
 
-    words = _extract_words(content, lang_code, n, banned=banned)
+    # パースと整形
+    lines = [l.strip("・-—• ").strip() for l in content.splitlines() if l.strip()]
+    lines = [re.sub(r"^\d+[.)] ?", "", l) for l in lines if l]
+    words = [l for l in lines if len(l) <= 20]
 
+    # fallback: 汎用語リスト
     if len(words) < n:
-        need = n - len(words)
-        prompt2 = _gen_more_words_excluding(theme_for_prompt, lang_code, need, exclude=words, diff_hint="")
-        content2 = ""
-        for attempt in range(2):
-            try:
-                rsp2 = GPT.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[{"role": "user", "content": prompt2}],
-                    temperature=LIST_TEMP + 0.1 * attempt,
-                    top_p=0.9,
-                )
-                content2 = (rsp2.choices[0].message.content or "")
-            except Exception:
-                content2 = ""
-            if content2 and content2.strip():
-                break
-        more = _extract_words(content2, lang_code, need, banned=banned | set(words))
-        words.extend([w for w in more if w not in words])
-
-    if len(words) < n:
+        print(f"[FALLBACK] insufficient vocab for {theme} ({lang_code}), got {len(words)}")
         FALLBACKS = {
-            "ja": ["清掃", "鍵", "フロント", "支払い", "荷物", "朝食", "通路", "館内", "地図", "案内"],
-            "ko": ["청소", "열쇠", "프런트", "결제", "짐", "아침식사", "복도", "관내", "지도", "안내"],
-            "zh": ["清扫", "钥匙", "前台", "付款", "行李", "早餐", "走廊", "馆内", "地图", "指引"],
-            "es": ["llave", "pago", "equipaje", "desayuno", "pasillo", "mapa", "servicio"],
-            "pt": ["chave", "pagamento", "bagagem", "café da manhã", "corredor", "mapa", "serviço"],
-            "fr": ["clé", "paiement", "bagage", "petit-déjeuner", "couloir", "plan", "service"],
-            "id": ["kunci", "pembayaran", "bagasi", "sarapan", "lorong", "peta", "layanan"],
-            "en": ["key", "payment", "luggage", "breakfast", "hallway", "map", "service"],
+            "ja": ["ホテル", "旅行", "レストラン", "買い物", "空港", "食べ物", "時間", "地図", "支払い"],
+            "ko": ["호텔", "여행", "식당", "쇼핑", "공항", "음식", "시간", "지도", "결제"],
+            "zh": ["酒店", "旅行", "餐厅", "购物", "机场", "食物", "时间", "地图", "付款"],
+            "es": ["hotel", "viaje", "restaurante", "compras", "aeropuerto", "comida", "tiempo", "mapa", "pago"],
+            "pt": ["hotel", "viagem", "restaurante", "compras", "aeroporto", "comida", "tempo", "mapa", "pagamento"],
+            "fr": ["hôtel", "voyage", "restaurant", "achats", "aéroport", "repas", "temps", "carte", "paiement"],
+            "id": ["hotel", "perjalanan", "restoran", "belanja", "bandara", "makanan", "waktu", "peta", "pembayaran"],
+            "en": ["hotel", "travel", "restaurant", "shopping", "airport", "food", "time", "map", "payment"],
         }
-        fb = FALLBACKS.get(lang_code, FALLBACKS["en"])
-        for fw in fb:
-            if len(words) >= n:
-                break
-            key = fw.lower() if lang_code not in ("ja", "ko", "zh") else fw
-            if fw not in banned and fw not in words:
-                words.append(fw)
+        base = FALLBACKS.get(lang_code, FALLBACKS["en"])
+        need = n - len(words)
+        words += random.sample(base, min(need, len(base)))
 
     return words[:n]
-
+    
 def _gen_vocab_list_from_spec(spec: dict, lang_code: str) -> list[str]:
     """
     spec（theme/context/pos/relation_mode/difficulty/pattern_hint）を尊重して語彙抽出。

@@ -502,10 +502,6 @@ def _gen_conversation_using_words(words: list[str], lang_code: str, lines_per_ro
         "Alternate strictly starting with Alice:. One short sentence per line. Return ONLY the dialogue lines."
     )
     try:
-        rsp = GPT.chat_completions.create  # guard for older clients
-    except AttributeError:
-        pass
-    try:
         rsp = GPT.chat.completions.create(
             model="gpt-4o-mini",
             messages=[system, {"role": "user", "content": user}],
@@ -652,8 +648,8 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
                 if key not in seen_words:
                     pool.append(w)
             if len(pool) < VOCAB_WORDS:
-                # 足りなければ自動補完
-                pool.extend(_pick_unique_words(master_theme, audio_lang, VOCAB_WORDS - len(pool), base_spec, seen_words=set()))
+                # ⚠ 修正点: 既出回避のため共有 seen_words を渡す
+                pool.extend(_pick_unique_words(master_theme, audio_lang, VOCAB_WORDS - len(pool), base_spec, seen=seen_words))
             words_round = pool[:VOCAB_WORDS]
             # seen 登録
             for w in words_round:
@@ -666,7 +662,7 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
         for w in words_round:
             ex = _gen_example_sentence(w, audio_lang, master_context)
 
-            # 単語1
+            # 単語2回
             for _rep in (0, 1):
                 line = w
                 tts_line = line
@@ -770,7 +766,7 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
     # lines.json（冒頭タイトル＋全ラウンド）
     lines_data = []
     for i, dur in enumerate(new_durs):
-        row = ["N"]  # N/Alice/Bob を字幕上は非表示でも、ここは話者名は N固定でOK（subtitle_video 側で Nラベル非表示）
+        row = ["N"]  # 字幕上は N を非表示（subtitle_video の既定）。中央寄せは --center-n で担保。
         for r in range(len(subs)):
             row.append(sub_rows[r][i])
         row.append(dur)
@@ -854,7 +850,6 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
             t = fallback_templates.get(title_lang, f"{pos_tag}{theme_local} ({cefr})")
             return sanitize_title(t)[:70]
 
-        # 簡易版（失敗時フォールバック）
         try:
             client = OpenAI()
             try:
@@ -1004,7 +999,7 @@ def run_all(topic, turns, privacy, do_upload, chunk_size):
             if topic.strip().lower() == "auto":
                 try:
                     picked_raw = pick_by_content_type("vocab", audio_lang, return_context=True)
-                    # _normalize_spec をローカル簡易実装
+                    # _normalize_spec 簡易版
                     if isinstance(picked_raw, dict):
                         picked_topic = picked_raw.get("theme") or "general vocabulary"
                         context_hint = picked_raw.get("context") or ""

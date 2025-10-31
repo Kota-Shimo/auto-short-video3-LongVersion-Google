@@ -15,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from shutil import rmtree
 
+import random  # ← import 忘れずに！
 import yaml
 from pydub import AudioSegment
 from openai import OpenAI
@@ -73,6 +74,29 @@ BANNED_COMMON_BY_LANG = {
     "id": {"check-in", "reservasi", "check-out", "struk", "lift", "lobi", "upgrade"},
     "en": {"check-in", "reservation", "checkout", "receipt", "elevator", "lobby", "upgrade"},
 }
+
+# ───────────────────────────────────────────────
+# CEFR 難易度の決定（動画内で固定・動画ごとにランダム可）
+# ───────────────────────────────────────────────
+_VALID_CEFR = {"A1","A2","B1","B2"}
+
+def _pick_difficulty_for_video() -> str:
+    explicit = os.getenv("CEFR_LEVEL", "").strip().upper()
+    if explicit in _VALID_CEFR:
+        return explicit
+
+    pool_env = os.getenv("CEFR_POOL", "A1,A2,B1,B2")
+    pool = [x.strip().upper() for x in pool_env.split(",") if x.strip()]
+    pool = [x for x in pool if x in _VALID_CEFR] or ["A1","A2","B1","B2"]
+
+    seed_env = os.getenv("VIDEO_SEED", "").strip()
+    if seed_env:
+        try:
+            random.seed(int(seed_env))
+        except Exception:
+            random.seed(seed_env)
+
+    return random.choice(pool)
 
 def _banned_for(lang_code: str) -> set[str]:
     return set(BANNED_COMMON_BY_LANG.get(lang_code, set()))
@@ -928,8 +952,8 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
     raw = (topic or "").replace("\r", "\n").strip()
     is_word_list = bool(re.search(r"[,;\n]", raw)) and len([w for w in re.split(r"[\n,;]+", raw) if w.strip()]) >= 2
 
-    # 全体統一の難易度（指定なければA2）
-    difficulty_for_all = os.getenv("CEFR_LEVEL", "").strip().upper() or "A2"
+    # 全体統一の難易度（環境変数で固定 or ランダム）
+    difficulty_for_all = _pick_difficulty_for_video()
     pattern_for_all = None
     pos_for_all = None
 

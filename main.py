@@ -7,9 +7,10 @@ main.py – VOCAB専用版（単純結合＋日本語ふりがな[TTSのみ]＋�
 - 追加: topic_picker の文脈ヒント（context）を例文生成に渡して日本語崩れを抑制。
 - 追加: ラングエージルール（厳密モノリンガル・記号/注釈禁止）を例文生成に統合。
 - 追加: 単語2行の字幕は「例文＋テーマ＋品詞ヒント」で1語に確定する文脈訳へ切替。
+- 追加: 動画冒頭に「本編テーマのタイトル」を N が1回だけ読み上げ・表示（字幕は各言語1行）。
 """
 
-import argparse, logging, re, json, subprocess, os, sys  # ← sys を追加
+import argparse, logging, re, json, subprocess, os, sys
 from datetime import datetime
 from pathlib import Path
 from shutil import rmtree
@@ -278,7 +279,7 @@ def _gen_example_sentence(word: str, lang_code: str, context_hint: str = "") -> 
         if ctx:
             user += f" Scene hint: {ctx}"
 
-    for _ in range(5):  # ← 試行回数を5回に増加
+    for _ in range(5):
         try:
             rsp = GPT.chat.completions.create(
                 model="gpt-4o-mini",
@@ -495,16 +496,24 @@ def _kana_reading(word: str) -> str:
 # ───────────────────────────────────────────────
 # 例文取得（同じ3行ブロックの3行目）
 # ───────────────────────────────────────────────
-def _example_for_index(valid_dialogue: list[tuple[str, str]], idx0: int) -> str:
+def _example_for_index(valid_dialogue: list[tuple[str, str]], idx0: int, title_added: bool) -> str:
     """
-    valid_dialogue は 3行1組（[word, word, example]）で並ぶ。
-    idx0 がその組の 0/1/2 のいずれでも、例文は常に +2 の位置。
+    valid_dialogue は先頭にタイトル行（任意）→ 以降が 3行1組（[word, word, example]）
+    idx0 は valid_dialogue の0始まりインデックス。
+    タイトル行がある場合は、その1行をスキップして 3行周期を計算する。
     """
-    role_idx = idx0 % 3  # 0/1/2
-    base = idx0 - role_idx
-    ex_pos = base + 2
-    if 0 <= ex_pos < len(valid_dialogue):
-        return valid_dialogue[ex_pos][1]
+    if title_added and idx0 == 0:
+        return ""  # タイトル行自身には例文なし
+    # タイトル行ぶんを差し引いた位置で3行周期
+    base_idx = idx0 - (1 if title_added else 0)
+    if base_idx < 0:
+        return ""
+    role_idx = base_idx % 3  # 0/1/2
+    block_base = base_idx - role_idx  # ブロック先頭相対
+    ex_pos_rel = block_base + 2       # 例文は +2
+    ex_abs = (1 if title_added else 0) + ex_pos_rel
+    if 0 <= ex_abs < len(valid_dialogue):
+        return valid_dialogue[ex_abs][1]
     return ""
 
 # ───────────────────────────────────────────────
@@ -548,224 +557,35 @@ def translate_word_context(word: str, target_lang: str, src_lang: str, theme: st
     except Exception:
         return word
 
-def make_title(theme, title_lang: str, audio_lang_for_label: str | None = None,
-               pos: list[str] | None = None,
-               difficulty: str | None = None,
-               pattern_hint: str | None = None):
-    
 # ───────────────────────────────────────────────
-    """
-    YouTube向けタイトル生成（多言語対応・安全フォールバック付き）
-    - 品詞(pos), 難易度(difficulty), pattern_hintを反映
-    - title_lang に合わせてプロンプト/長さ/例文を切替
-    """
+# 冒頭タイトル（本編テーマ）を音声言語で1回だけ読み上げる
 # ───────────────────────────────────────────────
-    def _fallback_title():
-        # タイトル言語へテーマを翻訳（英語ならそのまま）
-        try:
-            theme_local = theme if title_lang == "en" else translate(theme, title_lang)
-        except Exception:
-            theme_local = theme
-
-        cefr = (difficulty or "A2").upper()
-        pos_tag = ""
-        if pos and isinstance(pos, list) and len(pos) == 1:
-            pos_tag = f"[{pos[0]}] "
-
-        # 言語別の最小フォールバック
-        if title_lang == "ja":
-            label = JP_CONV_LABEL.get(audio_lang_for_label or "", "")
-            base = f"{theme_local}で使える英語（{cefr}）"
-            t = f"{pos_tag}{base}"
-            if label and label not in t:
-                t = f"{label} {t}"
-            return sanitize_title(t)[:40]
-
-        # 主要言語の軽量フォールバック
-        fallback_templates = {
-            "en": f"{pos_tag}{theme_local.capitalize()} vocab ({cefr})",
-            "pt": f"{pos_tag}Vocabulário de {theme_local} ({cefr})",
-            "es": f"{pos_tag}Vocabulario de {theme_local} ({cefr})",
-            "fr": f"{pos_tag}Vocabulaire : {theme_local} ({cefr})",
-            "id": f"{pos_tag}Kosakata {theme_local} ({cefr})",
-            "ko": f"{pos_tag}{theme_local} 필수 어휘 ({cefr})",
-        }
-        t = fallback_templates.get(title_lang, f"{pos_tag}{theme_local} ({cefr})")
-        return sanitize_title(t)[:70]
-
-    # ---- 言語別ルールと例（LLM用）----
-    max_len = 40 if title_lang == "ja" else 70
-    cefr = (difficulty or "A2").upper()
-    pos_str = ", ".join(pos) if pos else ""
-    pattern = pattern_hint or ""
-
+def _build_intro_line(theme: str, audio_lang: str, difficulty: str | None) -> str:
+    """
+    動画冒頭で N が読み上げる短いタイトル文を返す（音声言語で1文）。
+    表示・TTSはこの1回のみ。以降の本文では繰り返さない。
+    """
     try:
-        # タイトル言語へテーマを翻訳（日本語以外も対応）
-        theme_local = theme if title_lang == "en" else translate(theme, title_lang)
+        theme_local = theme if audio_lang == "en" else translate(theme, audio_lang)
     except Exception:
         theme_local = theme
+    cefr = (difficulty or "").strip().upper()
 
-    lang_rules = {
-        "ja": {
-            "rule": (
-                "You are a YouTube title creator for language-learning Shorts. "
-                "Write ONE concise, clickable Japanese title under 40 characters. "
-                "Avoid emojis, quotes, and extra punctuation. Keep it natural."
-            ),
-            "examples": [
-                "ホテルチェックインで使える英語（A2）",
-                "職場でよく使う英語フレーズ（B1）",
-                "旅行で役立つ動詞マスター（A2）",
-            ],
-        },
-        "en": {
-            "rule": (
-                "You are a YouTube title creator for language-learning Shorts. "
-                "Write ONE concise, clickable English title under 70 characters. "
-                "Avoid emojis, quotes, and extra punctuation. Keep it natural."
-            ),
-            "examples": [
-                "Essential hotel check-in phrases (A2)",
-                "Workplace verbs you’ll actually use (B1)",
-                "Travel phrases made easy (A2)",
-            ],
-        },
-        "pt": {
-            "rule": (
-                "Crie UM título curto e clicável em português (até 70 caracteres) "
-                "para um Short de aprendizado de idiomas. Sem emojis, aspas ou pontuação extra."
-            ),
-            "examples": [
-                "Frases essenciais para check-in no hotel (A2)",
-                "Verbos úteis no trabalho (B1)",
-                "Expressões de viagem fáceis (A2)",
-            ],
-        },
-        "es": {
-            "rule": (
-                "Escribe UN título breve y atractivo en español (máx. 70 caracteres) "
-                "para un Short de aprendizaje de idiomas. Sin emojis ni comillas."
-            ),
-            "examples": [
-                "Frases clave para el check-in del hotel (A2)",
-                "Verbos útiles en el trabajo (B1)",
-                "Expresiones fáciles para viajar (A2)",
-            ],
-        },
-        "fr": {
-            "rule": (
-                "Rédigez UN titre court et percutant en français (70 caractères max) "
-                "pour un Short d'apprentissage des langues. Pas d’emojis ni de guillemets."
-            ),
-            "examples": [
-                "Phrases clés pour l’enregistrement à l’hôtel (A2)",
-                "Verbes utiles au travail (B1)",
-                "Expressions de voyage faciles (A2)",
-            ],
-        },
-        "id": {
-            "rule": (
-                "Tulis SATU judul pendek dan menarik dalam bahasa Indonesia (maks 70 karakter) "
-                "untuk Shorts pembelajaran bahasa. Tanpa emoji atau kutip."
-            ),
-            "examples": [
-                "Frasa penting untuk check-in hotel (A2)",
-                "Verba berguna di tempat kerja (B1)",
-                "Ekspresi mudah untuk perjalanan (A2)",
-            ],
-        },
-        "ko": {
-            "rule": (
-                "언어 학습 쇼츠용 한국어 제목을 하나만 작성하세요(70자 이내). "
-                "이모지, 따옴표, 과한 구두점은 사용하지 마세요."
-            ),
-            "examples": [
-                "호텔 체크인 필수 표현 (A2)",
-                "직장에서 자주 쓰는 동사 (B1)",
-                "여행에 유용한 표현 (A2)",
-            ],
-        },
-    }
-
-    rules = lang_rules.get(title_lang, lang_rules["en"])
-    examples_block = "\n".join(rules["examples"])
-
-    # ---- LLM 生成（失敗時はフォールバック）----
-    try:
-        from openai import OpenAI
-        client = OpenAI()
-        prompt = (
-            f"{rules['rule']}\n\n"
-            f"Topic: {theme_local}\n"
-            f"Difficulty: {cefr}\n"
-            f"Part of speech (optional): {pos_str or '—'}\n"
-            f"Pattern hint (optional): {pattern or '—'}\n\n"
-            f"Examples:\n{examples_block}\n\n"
-            "Return ONLY the title text."
-        )
-        rsp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
-            top_p=0.9,
-        )
-        out = (rsp.choices[0].message.content or "").strip()
-        title = sanitize_title(out)
-        if not title or len(title) < 4:
-            return _fallback_title()
-
-        # 日本語のみ会話ラベル付与（重複防止）
-        if title_lang == "ja":
-            label = JP_CONV_LABEL.get(audio_lang_for_label or "", "")
-            if label and label not in title:
-                title = f"{label} {title}"
-
-        return title[:max_len]
-    except Exception:
-        return _fallback_title()
-
-def make_desc(theme, title_lang: str):
-    if title_lang not in LANG_NAME:
-        title_lang = "en"
-    try:
-        theme_local = theme if title_lang == "en" else translate(theme, title_lang)
-    except Exception:
-        theme_local = theme
-
-    msg = {
-        "ja": f"{theme_local} に必須の語彙を短時間でチェック。声に出して一緒に練習しよう！ #vocab #learning",
-        "en": f"Quick practice for {theme_local} vocabulary. Repeat after the audio! #vocab #learning",
-        "pt": f"Pratique rápido o vocabulário de {theme_local}. Repita em voz alta! #vocab #aprendizado",
-        "es": f"Práctica rápida de vocabulario de {theme_local}. ¡Repite en voz alta! #vocab #aprendizaje",
-        "ko": f"{theme_local} 어휘를 빠르게 연습하세요. 소리 내어 따라 말해요! #vocab #learning",
-        "id": f"Latihan cepat kosakata {theme_local}. Ucapkan keras-keras! #vocab #belajar",
-    }
-    return msg.get(title_lang, msg["en"])
-
-# ───────────────────────────────────────────────
-# タグ生成（難易度・品詞バッジを追加）
-# ───────────────────────────────────────────────
-def make_tags(theme, audio_lang, subs, title_lang, difficulty=None, pos=None):
-    tags = [
-        theme, "vocabulary", "language learning", "speaking practice",
-        "listening practice", "subtitles"
-    ]
-    if difficulty:
-        tags.append(f"CEFR {difficulty}")
-    if pos:
-        for p in pos:
-            tags.append(p)
-
-    for code in subs:
-        if code in LANG_NAME:
-            tags.append(f"{LANG_NAME[code]} subtitles")
-
-    seen, out = set(), []
-    for t in tags:
-        if t not in seen:
-            seen.add(t)
-            out.append(t)
-    return out[:15]
+    if audio_lang == "ja":
+        base = f"今日のテーマは「{theme_local}」。"
+        return base  # CEFRは字幕/メタで担保、音声はシンプルに
+    if audio_lang == "ko":
+        return f"오늘의 주제는 {theme_local}입니다."
+    if audio_lang == "id":
+        return f"Topik hari ini: {theme_local}."
+    if audio_lang == "pt":
+        return f"O tema de hoje é {theme_local}."
+    if audio_lang == "es":
+        return f"El tema de hoy es {theme_local}."
+    if audio_lang == "fr":
+        return f"Le thème d’aujourd’hui est {theme_local}."
+    # default (en)
+    return f"Today's theme: {theme_local}."
 
 # ───────────────────────────────────────────────
 # 単純結合（WAV中間・行頭無音・最短尺・行間ギャップ）
@@ -802,13 +622,21 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
         vocab_words = [w.strip() for w in re.split(r"[\n,;]+", raw) if w.strip()]
         theme = "custom list"
         local_context = ""  # 手入力リスト時は文脈ヒントなし
+        difficulty_for_all = os.getenv("CEFR_LEVEL", "").strip().upper() or "A2"
+        pos_for_all = None
+        pattern_for_all = None
+        spec_for_meta = {"theme": theme, "context": "", "difficulty": difficulty_for_all}
     else:
         # spec が来ていればそれを使用
         if isinstance(spec, dict):
             theme = spec.get("theme") or topic
             local_context = (spec.get("context") or context_hint or "")
             vocab_words = _gen_vocab_list_from_spec(spec, audio_lang)
-            # デバッグ: spec を保存（常にOK）
+            difficulty_for_all = (spec.get("difficulty") or os.getenv("CEFR_LEVEL","A2")).upper()
+            pos_for_all = spec.get("pos") or None
+            pattern_for_all = spec.get("pattern_hint") or None
+            spec_for_meta = spec
+            # デバッグ: spec を保存
             try:
                 (TEMP / "spec.json").write_text(json.dumps(spec, ensure_ascii=False, indent=2), encoding="utf-8")
             except Exception:
@@ -816,22 +644,46 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
         else:
             theme = topic
             vocab_words = _gen_vocab_list(theme, audio_lang, words_count)
-            local_context = context_hint or ""  # AUTO時に受け取った文脈を使う
+            local_context = context_hint or ""  # AUTO時に受け取った文脈
+            difficulty_for_all = os.getenv("CEFR_LEVEL", "").strip().upper() or "A2"
+            pos_for_all = None
+            pattern_for_all = None
+            spec_for_meta = {"theme": theme, "context": local_context, "difficulty": difficulty_for_all}
 
-    # 3行ブロック: 単語 → 単語 → 例文
-    dialogue = []
+    audio_parts, sub_rows = [], [[] for _ in subs]
+    plain_lines, tts_lines = [], []
+
+    # ── ① 冒頭タイトル行（Nのみ・1回だけ）────────────────────
+    intro_line = _build_intro_line(theme, audio_lang, difficulty_for_all)
+    # TTS用整形（JAは句点保証）
+    intro_tts = _ensure_period_for_sentence(intro_line, audio_lang) if audio_lang != "ja" else intro_line
+    out_audio = TEMP / f"00_intro.wav"
+    speak(audio_lang, "N", intro_tts, out_audio, style=("serious" if audio_lang == "ja" else "neutral"))
+    audio_parts.append(out_audio)
+    plain_lines.append(intro_line)
+    tts_lines.append(intro_tts)
+    # 字幕：音声言語は原文、他言語は1文翻訳
+    for r, lang in enumerate(subs):
+        if lang == audio_lang:
+            sub_rows[r].append(_clean_sub_line(intro_line, lang))
+        else:
+            try:
+                sub_rows[r].append(_clean_sub_line(translate_sentence_strict(intro_line, audio_lang, lang), lang))
+            except Exception:
+                sub_rows[r].append(_clean_sub_line(intro_line, lang))
+
+    # ── ② 本文（3行1組：単語→単語→例文）────────────────────
+    dialogue_body = []
     for w in vocab_words:
         ex = _gen_example_sentence(w, audio_lang, local_context)
-        dialogue.extend([("N", w), ("N", w), ("N", ex)])
+        dialogue_body.extend([("N", w), ("N", w), ("N", ex)])
 
-    valid_dialogue = [(spk, line) for (spk, line) in dialogue if line.strip()]
-    audio_parts, sub_rows = [], [[] for _ in subs]
+    valid_dialogue = [(spk, line) for (spk, line) in dialogue_body if line.strip()]
+    title_added = True  # 先頭にタイトル1行を追加済み
 
-    plain_lines = [line for (_, line) in valid_dialogue]
-    tts_lines   = []
-
-    for i, (spk, line) in enumerate(valid_dialogue, 1):
-        role_idx = (i - 1) % 3  # 0/1/2
+    for idx_body, (spk, line) in enumerate(valid_dialogue, 1):
+        # 先頭にタイトルがあるため、本文の周回は (idx_body-1) % 3
+        role_idx = (idx_body - 1) % 3  # 0/1/2
 
         tts_line = line
         if audio_lang == "ja":
@@ -840,7 +692,7 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
                 tts_line = _PARENS_JA.sub(" ", tts_line).strip()
                 tts_line = _ensure_period_for_sentence(tts_line, audio_lang)
             else:
-                # 単語行：かな読み＋句点で抑揚安定（ただし1文字語は句点を付けない）
+                # 単語行：かな読み＋句点（1文字語は句点なし）
                 if _KANJI_ONLY.fullmatch(line):
                     yomi = _kana_reading(line)
                     if yomi:
@@ -848,30 +700,29 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
                 base = re.sub(r"[。！？!?]+$", "", tts_line).strip()
                 tts_line = base + "。" if len(base) >= 2 else base
         else:
-            # 非日本語は例文のみ終止を保証
             if role_idx == 2:
                 tts_line = _ensure_period_for_sentence(tts_line, audio_lang)
 
-        out_audio = TEMP / f"{i:02d}.wav"
-        # 日本語は語尾安定のため serious
+        out_audio = TEMP / f"{idx_body:02d}.wav"
         style_for_tts = "serious" if audio_lang == "ja" else "neutral"
-
         speak(audio_lang, spk, tts_line, out_audio, style=style_for_tts)
         audio_parts.append(out_audio)
+        plain_lines.append(line)
         tts_lines.append(tts_line)
 
-        # 字幕（音声言語=原文、他言語=翻訳）→ クリーニングして1行化
+        # 字幕（音声言語=原文、他言語=翻訳）
         for r, lang in enumerate(subs):
             if lang == audio_lang:
                 sub_rows[r].append(_clean_sub_line(line, lang))
             else:
                 try:
                     if role_idx in (0, 1):  # 単語2行は文脈つき1語訳
-                        example_ctx = _example_for_index(valid_dialogue, i-1)
+                        # タイトル1行を考慮して例文行を特定
+                        example_ctx = _example_for_index([("N", intro_line)] + valid_dialogue, idx_body, title_added=True)
                         # POSヒント：spec優先→日本語のみ簡易推定
                         pos_hint = None
-                        if isinstance(spec, dict) and spec.get("pos"):
-                            pos_hint = ",".join(spec["pos"])
+                        if isinstance(spec_for_meta, dict) and spec_for_meta.get("pos"):
+                            pos_hint = ",".join(spec_for_meta["pos"])
                         elif audio_lang == "ja":
                             _k = _guess_ja_pos(line)
                             pos_map = {"verb":"verb", "iadj":"adjective", "naadj":"adjective", "noun":"noun"}
@@ -882,14 +733,13 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
                             theme=theme, example=example_ctx, pos_hint=pos_hint
                         )
                     else:
-                        # 例文行はまず通常翻訳 → ダメなら厳密プロンプトで再翻訳
+                        # 例文は通常翻訳→必要なら厳密再翻訳
                         trans = translate_sentence_strict(line, src_lang=audio_lang, target_lang=lang)
                 except Exception:
                     trans = line
                 sub_rows[r].append(_clean_sub_line(trans, lang))
 
-    # 単純結合 → 整音 → mp3
-    # ★ 日本語だけ間と最短尺を別ENVで調整
+    # ── 単純結合 → 整音 → mp3 ─────────────────────────────
     gap_ms = GAP_MS_JA if audio_lang == "ja" else GAP_MS
     pre_ms = PRE_SIL_MS_JA if audio_lang == "ja" else PRE_SIL_MS
     min_ms = MIN_UTTER_MS_JA if audio_lang == "ja" else MIN_UTTER_MS
@@ -898,54 +748,51 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
     enhance(TEMP/"full_raw.wav", TEMP/"full.wav")
     AudioSegment.from_file(TEMP/"full.wav").export(TEMP/"full.mp3", format="mp3")
 
-    # 背景画像（日本語テーマを英語に翻訳して検索）
+    # 背景画像
     bg_png = TEMP / "bg.png"
-
     try:
-        theme_en = translate(theme, "en")  # 日本語テーマを英語化
+        theme_en = translate(theme, "en")
     except Exception:
         theme_en = theme
 
-    first_word = valid_dialogue[0][1] if valid_dialogue else theme
-
-    def _is_ascii(s: str) -> bool:
-        try:
-            s.encode("ascii")
-            return True
-        except Exception:
-            return False
-
-    # 検索クエリ
-    if not _is_ascii(first_word or ""):
-        query_for_bg = theme_en or "language learning"
-    else:
-        query_for_bg = first_word or theme_en or "learning"
-
+    # タイトル文を優先して検索語に使うと広くなりすぎることがあるため、テーマ英訳を利用
+    query_for_bg = theme_en or "learning"
     fetch_bg(query_for_bg, bg_png)
     
-    # lines.json
+    # lines.json（冒頭タイトル + 本文）
+    # new_durs は [intro, 本文…] の順で作られている
+    # sub_rows[*] も intro ぶんが先頭に入っている
     lines_data = []
-    for i, ((spk, txt), dur) in enumerate(zip(valid_dialogue, new_durs)):
-        row = [spk]
+    # 先頭はタイトル行
+    idx = 0
+    row_intro = ["N"]
+    for r in range(len(subs)):
+        row_intro.append(sub_rows[r][idx])
+    row_intro.append(new_durs[idx])
+    lines_data.append(row_intro)
+
+    # 本文
+    for j in range(1, len(new_durs)):
+        row = ["N"]
         for r in range(len(subs)):
-            row.append(sub_rows[r][i])
-        row.append(dur)
+            row.append(sub_rows[r][j])
+        row.append(new_durs[j])
         lines_data.append(row)
+
     (TEMP/"lines.json").write_text(json.dumps(lines_data, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    # ─────────────────────────
-    # デバッグ出力（常に出力する）
-    # ─────────────────────────
+    # ───────────────────────── デバッグ出力 ─────────────────────────
     try:
-        (TEMP / "script_raw.txt").write_text("\n".join(plain_lines), encoding="utf-8")
+        (TEMP / "script_raw.txt").write_text("\n".join([intro_line] + [l for (_, l) in valid_dialogue]), encoding="utf-8")
         (TEMP / "script_tts.txt").write_text("\n".join(tts_lines), encoding="utf-8")
         with open(TEMP / "subs_table.tsv", "w", encoding="utf-8") as f:
             header = ["idx", "text"] + [f"sub:{code}" for code in subs]
             f.write("\t".join(header) + "\n")
-            for idx in range(len(valid_dialogue)):
-                row = [str(idx+1), _clean_sub_line(valid_dialogue[idx][1], audio_lang)]
+            all_lines_for_table = [intro_line] + [l for (_, l) in valid_dialogue]
+            for idx_tbl in range(len(all_lines_for_table)):
+                row = [str(idx_tbl+1), _clean_sub_line(all_lines_for_table[idx_tbl], audio_lang)]
                 for r in range(len(subs)):
-                    row.append(sub_rows[r][idx])
+                    row.append(sub_rows[r][idx_tbl])
                 f.write("\t".join(row) + "\n")
         with open(TEMP / "durations.txt", "w", encoding="utf-8") as f:
             total = 0.0
@@ -975,6 +822,8 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
         "--chunk", str(chunk_size),
         "--rows", str(len(subs)),
         "--out", str(final_mp4),
+        "--center-n",                 # ★ 追加：N 行を中央寄せ表示
+        # ※ N ラベルはデフォ非表示（subtitle_video 側デフォが hide）
     ]
     logging.info("🔹 chunk_builder cmd: %s", " ".join(cmd))
     subprocess.run(cmd, check=True)
@@ -986,10 +835,10 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
     pos_for_title = None
     difficulty_for_title = None
     pattern_for_title = None
-    if isinstance(spec, dict):
-        pos_for_title = spec.get("pos") or None
-        difficulty_for_title = spec.get("difficulty") or None
-        pattern_for_title = spec.get("pattern_hint") or None
+    if isinstance(spec_for_meta, dict):
+        pos_for_title = spec_for_meta.get("pos") or None
+        difficulty_for_title = spec_for_meta.get("difficulty") or None
+        pattern_for_title = spec_for_meta.get("pattern_hint") or None
 
     title = make_title(
         theme, title_lang, audio_lang_for_label=audio_lang,
@@ -998,9 +847,8 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
     desc  = make_desc(theme, title_lang)
     tags  = make_tags(theme, audio_lang, subs, title_lang,
                       difficulty=difficulty_for_title, pos=pos_for_title)
-    # ─────────────────────────────
-    # 改良版アップロード（トークン切れ＆上限対応）
-    # ─────────────────────────────
+
+    # ───────────────────────────── 改良版アップロード ─────────────────────────────
     def _is_limit_error(err: Exception) -> bool:
         s = str(err)
         return (
@@ -1034,12 +882,9 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
                 logging.info(f"[UPLOAD] ✅ success on account='{acc}'")
                 return True
             except Exception as e:
-                # 上限エラーなら次のアカウントへ
                 if _is_limit_error(e):
                     logging.warning(f"[UPLOAD] ⚠️ limit reached on account='{acc}' → trying next fallback.")
                     continue
-
-                # トークン切れ（expire/revoke）なら即停止＋通知
                 if _is_token_error(e):
                     logging.error(f"[UPLOAD] ❌ TOKEN ERROR on account='{acc}' — expired/revoked/unauthorized.")
                     try:
@@ -1050,12 +895,9 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
                     except Exception:
                         pass
                     raise SystemExit(f"[ABORT] Token expired/revoked for account='{acc}'. Please reauthorize.")
-
-                # 想定外のエラーは raise（バグ検出用）
                 logging.exception(f"[UPLOAD] unexpected error on account='{acc}'")
                 raise
 
-        # すべて上限エラー → スキップして次のコンボへ進行
         msg = f"Upload skipped due to per-account limits. tried={tried}"
         logging.warning("[UPLOAD] " + msg)
         try:
@@ -1075,7 +917,6 @@ def run_all(topic, turns, privacy, do_upload, chunk_size):
     isolated = os.getenv("ISOLATED_RUN", "0") == "1"
 
     if isolated:
-        # ここは子プロセス用：従来通りに実行（TARGET_ONLY があれば 1 アカウントのみになる）
         for combo in COMBOS:
             audio_lang  = combo["audio"]
             subs        = combo["subs"]
@@ -1110,7 +951,7 @@ def run_all(topic, turns, privacy, do_upload, chunk_size):
             )
         return
 
-    # ここは親プロセス：各アカウントごとに子プロセスで独立実行
+    # 親プロセス：各アカウントごとに子プロセスで独立実行
     for combo in COMBOS:
         account = combo.get("account", "default")
         if TARGET_ONLY and account != TARGET_ONLY:
@@ -1127,7 +968,7 @@ def run_all(topic, turns, privacy, do_upload, chunk_size):
             cmd.append("--no-upload")
 
         env = os.environ.copy()
-        env["ISOLATED_RUN"] = "1"   # ← 子プロセス側で再帰起動を止めるためのフラグ
+        env["ISOLATED_RUN"] = "1"
 
         logging.info(f"▶ Spawning isolated run for account={account}: {' '.join(cmd)}")
         subprocess.run(cmd, check=False, env=env)
@@ -1137,11 +978,11 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     ap = argparse.ArgumentParser()
     ap.add_argument("topic", help="語彙テーマ。AUTO で自動選択。カンマ/改行区切りなら単語リストとして使用")
-    ap.add_argument("--turns", type=int, default=8)  # 互換用
+    ap.add_argument("--turns", type=int, default=8)  # 互換用（未使用でも維持）
     ap.add_argument("--privacy", default="unlisted", choices=["public","unlisted","private"])
     ap.add_argument("--lines-only", action="store_true")
     ap.add_argument("--no-upload", action="store_true")
-    ap.add_argument("--chunk", type=int, default=9999, help="Shortsは分割せず1本推奨")
+    ap.add_argument("--chunk", type=int, default=9999, help="Long動画は分割せず1本でOK")
     # ★ 追加: CLIからアカウントを指定できる
     ap.add_argument("--account", type=str, default="", help="この account のみ実行（combos.yaml の account 値に一致）")
     args = ap.parse_args()
@@ -1156,7 +997,6 @@ if __name__ == "__main__":
         if not selected:
             logging.error(f"[ABORT] No combos matched account='{TARGET_ONLY}'. Check combos.yaml.")
             raise SystemExit(2)
-        # in-place 置換（他からも参照されるため）
         COMBOS[:] = selected
         logging.info(f"[ACCOUNT FILTER] Running only for account='{TARGET_ONLY}' ({len(COMBOS)} combo(s)).")
 

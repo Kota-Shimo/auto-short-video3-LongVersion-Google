@@ -3,7 +3,7 @@
 main.py – VOCAB専用ロング動画（横向き16:9 / ラウンド制 / 日本語TTS最適化）
 - 1ラウンド = N単語（単語→単語→例文×N） + そのN語をすべて含む会話
 - ラウンドごとに「単語群→会話」を入れて次の単語群へ進む（群ごと対話）
-- 例文は常に「1文だけ」。失敗時は最大5回まで再生成、最後はフェールセーフ。
+- 例文は常に「1文だけ」。失敗時は最大6回まで再生成、最後はフェールセーフ。
 - 翻訳（字幕）は1行化、複文は先頭1文のみ採用。URL/絵文字/余分な空白を除去。
 - 単語の翻訳は「例文＋テーマ＋品詞ヒント」で1語に確定（文脈訳）。
 - 生成音声は横向きに最適化された本物の 1920x1080 キャンバス上でレンダ（黒帯なし）。
@@ -62,23 +62,10 @@ LANG_NAME = {
     "zh": "Chinese",
 }
 
-# ====== Title policy globals (外出ししてスコープ不一致を解消) ======
-INCLUDE_VOCAB_IN_TITLE = os.getenv("TITLE_VOCAB", "0") == "1"
-SERIES_LABELS = {
-    "en": "Real Practice Series",
-    "ja": "Real Practice シリーズ",
-    "ko": "Real Practice 시리즈",
-    "zh": "Real Practice 系列",
-    "es": "Serie Real Practice",
-    "pt": "Série Real Practice",
-    "fr": "Série Real Practice",
-    "id": "Seri Real Practice",
-}
-
-# ====== Common “too-safe” words to avoid (language-specific) ======
+# ====== “出がちの安全すぎる語”を抑制（テーマ無関連化を避ける） ======
 BANNED_COMMON_BY_LANG = {
     "ja": {"チェックイン", "チェックアウト", "予約", "領収書", "レシート", "ロビー", "エレベーター", "アップグレード", "客室", "部屋"},
-    "ko": {"체크인", "체크아웃", "예약", "영수증", "로비", "엘리ベ이터", "업그레이드", "객실"},
+    "ko": {"체크인", "체크아웃", "예약", "영수증", "로비", "엘리베이터", "업그레이드", "객실"},
     "zh": {"办理入住", "退房", "预订", "发票", "大堂", "电梯", "升级", "房间"},
     "es": {"registro", "reserva", "salida", "recibo", "ascensor", "vestíbulo", "mejora"},
     "pt": {"check-in", "reserva", "checkout", "recibo", "elevador", "saguão", "upgrade"},
@@ -89,6 +76,406 @@ BANNED_COMMON_BY_LANG = {
 
 def _banned_for(lang_code: str) -> set[str]:
     return set(BANNED_COMMON_BY_LANG.get(lang_code, set()))
+
+JP_CONV_LABEL = {
+    "en": "英会話", "ja": "日本語会話", "es": "スペイン語会話",
+    "pt": "ポルトガル語会話", "ko": "韓国語会話", "id": "インドネシア語会話",
+    "fr": "フランス語会話", "zh": "中国語会話",
+}
+
+with open(BASE / "combos.yaml", encoding="utf-8") as f:
+    COMBOS = yaml.safe_load(f)["combos"]
+
+# 例文フォールバック統計
+FALLBACK_STATS = {"example_attempts": 0, "example_fallbacks": 0}
+
+def reset_temp():
+    if TEMP.exists():
+        rmtree(TEMP)
+    TEMP.mkdir(exist_ok=True)
+
+def sanitize_title(raw: str) -> str:
+    """
+    タイトルは“切らない”方針：
+      - 余計な番号・全角空白などのノイズだけ除去
+      - YouTube上限(100文字)は静かにカット（省略記号は付けない）
+    """
+    title = re.sub(r"^\s*(?:\d+\s*[.)]|[-•・])\s*", "", raw)  # 先頭の番号や記号
+    title = re.sub(r"[\s\u3000]+", " ", title).strip()       # 連続スペース正規化
+    return title[:100]  # 省略記号は付けない
+
+def _infer_title_lang(audio_lang: str, subs: list[str], combo: dict) -> str:
+    if "title_lang" in combo and combo["title_lang"]:
+        return combo["title_lang"]
+    if len(subs) >= 2:
+        return subs[1]
+    for s in subs:
+        if s != audio_lang:
+            return s
+    return audio_lang
+
+def resolve_topic(arg_topic: str) -> str:
+    return arg_topic
+
+# ───────────────────────────────────────────────
+# クリーニング・バリデーション
+# ───────────────────────────────────────────────
+_URL_RE   = re.compile(r"https?://\S+")
+_NUM_LEAD = re.compile(r"^\s*\d+[\).:\-]\s*")
+_QUOTES   = re.compile(r'^[\"“”\']+|[\"“”\']+$')
+_EMOJI_RE = re.compile(r"[\U00010000-\U0010ffff]")
+_SENT_END = re.compile(r"[。.!?！？]")
+
+def _normalize_spaces(t: str) -> str:
+    return re.sub(r"\s+", " ", (t or "")).strip()
+
+def _clean_strict(text: str) -> str:
+    t = (text or "").strip()
+    t = _URL_RE.sub("", t)
+    t = _NUM_LEAD.sub("", t)
+    t = _QUOTES.sub("", t)
+    t = _EMOJI_RE.sub("", t)
+    t = re.sub(r"[\:\-–—]\s*$", "", t)
+    return _normalize_spaces(t)
+
+def _is_single_sentence(text: str) -> bool:
+    return len(_SENT_END.findall(text or "")) <= 1
+
+def _fits_length(text: str, lang_code: str) -> bool:
+    if lang_code in ("ja", "ko", "zh"):
+        return len(text or "") <= 30
+    return len(re.findall(r"\b\w+\b", text or "")) <= 12
+
+def _ensure_period_for_sentence(txt: str, lang_code: str) -> str:
+    t = txt or ""
+    return t if re.search(r"[。.!?！？]$", t) else t + ("。" if lang_code == "ja" else ".")
+
+def _clean_sub_line(text: str, lang_code: str) -> str:
+    t = _clean_strict(text).replace("\n", " ").strip()
+    m = _SENT_END.search(t)
+    if m:
+        t = t[:m.end()]
+    return t
+
+# ───────────────────────────────────────────────
+# モノリンガル強制（ko/ja/zhは英字禁止）
+# ───────────────────────────────────────────────
+_ASCII_LETTERS = re.compile(r"[A-Za-z]")
+
+def _monolingual_ok(text: str, lang_code: str) -> bool:
+    """ko/ja/zh は英字を含まないこと。その他は自由（Latin系言語のため）。"""
+    if lang_code in ("ko", "ja", "zh"):
+        return not _ASCII_LETTERS.search(text or "")
+    return True
+
+# TTS直前の非英語アスキー除去（安全側）
+def _purge_ascii_for_tts(text: str, lang_code: str) -> str:
+    if lang_code in ("ko", "ja", "zh"):
+        t = re.sub(r"[A-Za-z]+", "", text or "")
+        t = re.sub(r"\s{2,}", " ", t).strip()
+        return t or (text or "")
+    return text or ""
+
+# 英語以外で紛れ込んだ英単語を弱める軽いフィルタ（既存互換）
+_LATIN_WORD_RE = re.compile(r"\b[A-Za-z]{3,}\b")
+def _clean_non_english_ascii(text: str, lang_code: str) -> str:
+    if lang_code == "en":
+        return text
+    if lang_code in ("ko", "ja", "zh"):
+        return _purge_ascii_for_tts(text, lang_code)
+    t = text
+    t = _LATIN_WORD_RE.sub("", t)
+    t = re.sub(r"\s{2,}", " ", t).strip()
+    return t or text
+
+# ───────────────────────────────────────────────
+# 日本語TTS最適化
+# ───────────────────────────────────────────────
+_KANJI_ONLY = re.compile(r"^[一-龥々]+$")
+_PARENS_JA  = re.compile(r"\s*[\(\（][^)\）]{1,40}[\)\）]\s*")
+
+def _to_kanji_digits(num_str: str) -> str:
+    table = str.maketrans("0123456789", "〇一二三四五六七八九")
+    return num_str.translate(table)
+
+def normalize_ja_for_tts(text: str) -> str:
+    t = text or ""
+    t = re.sub(r"[\(（][^)\）]{1,40}[\)）]", "", t)
+    t = t.replace("/", "、").replace("-", "、").replace(":", "、").replace("・ ・", "・")
+    t = re.sub(r"\d{1,}", lambda m: _to_kanji_digits(m.group(0)), t)
+    t = re.sub(r"([A-Za-z]{2,})", lambda m: "・".join(list(m.group(1).lower())), t)
+    t = re.sub(r"[。]{2,}", "。", t)
+    t = re.sub(r"[、]{2,}", "、", t)
+    t = re.sub(r"\s{2,}", " ", t).strip()
+    if t and t[-1] not in "。！？!?":
+        t += "。"
+    return t
+
+# ───────────────────────────────────────────────
+# 翻訳強化
+# ───────────────────────────────────────────────
+_ASCII_ONLY = re.compile(r'^[\x00-\x7F]+$')
+
+def _looks_like_english(s: str) -> bool:
+    s = (s or "").strip()
+    return bool(_ASCII_ONLY.fullmatch(s)) and bool(re.search(r'[A-Za-z]', s))
+
+def _needs_retranslate(output: str, src_lang: str, target_lang: str, original: str) -> bool:
+    if target_lang == src_lang:
+        return False
+    out = (output or "").strip()
+    if not out:
+        return True
+    if out.lower() == (original or "").strip().lower():
+        return True
+    if target_lang == "en" and not _looks_like_english(out):
+        return True
+    return False
+
+def translate_sentence_strict(sentence: str, src_lang: str, target_lang: str) -> str:
+    try:
+        first = translate(sentence, target_lang)
+    except Exception:
+        first = ""
+    if not _needs_retranslate(first, src_lang, target_lang, sentence):
+        return _clean_sub_line(first, target_lang)
+    try:
+        _ = GPT.chat_completions.create
+    except AttributeError:
+        pass
+    try:
+        rsp = GPT.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{
+                "role":"user",
+                "content":(
+                    f"Translate from {LANG_NAME.get(src_lang,'source language')} "
+                    f"to {LANG_NAME.get(target_lang,'target language')}.\n"
+                    "Return ONLY the translation as a single sentence. "
+                    "No explanations, no quotes, no extra symbols.\n\n"
+                    f"Text: {sentence}"
+                )
+            }],
+            temperature=0.0, top_p=1.0
+        )
+        out = (rsp.choices[0].message.content or "").strip()
+        out = _clean_sub_line(out, target_lang)
+        if out:
+            return out
+    except Exception:
+        pass
+    return _clean_sub_line(sentence, target_lang)
+
+# ───────────────────────────────────────────────
+# ラングエージルール（厳密モノリンガル）
+# ───────────────────────────────────────────────
+def _lang_rules(lang_code: str) -> str:
+    if lang_code == "ja":
+        return (
+            "Write entirely in Japanese. "
+            "Do not include Latin letters or other languages. "
+            "Avoid ASCII symbols such as '/', '-', '→', '()', '[]', '<>', and '|'. "
+            "No translation glosses, brackets, or country/language mentions."
+        )
+    if lang_code == "ko":
+        return (
+            "Write entirely in Korean (Hangul only). "
+            "Do not include Latin letters or other languages. "
+            "Avoid ASCII symbols such as '/', '-', '→', '()', '[]', '<>', and '|'. "
+            "No translation glosses or stage directions."
+        )
+    if lang_code == "zh":
+        return (
+            "Write entirely in Chinese. "
+            "Do not include Latin letters or other languages. "
+            "Avoid ASCII symbols such as '/', '-', '→', '()", '[]', '<>', and '|'. "
+            "No translation glosses or stage directions."
+        )
+    lang_name = LANG_NAME.get(lang_code, "English")
+    return (
+        f"Write entirely in {lang_name}. "
+        "Do not code-switch or include other writing systems. "
+        "Avoid ASCII symbols like '/', '-', '→', '()', '[]', '<>', and '|'. "
+        "No translation glosses, brackets, or country/language mentions."
+    )
+
+# ───────────────────────────────────────────────
+# 日本語 fallback
+# ───────────────────────────────────────────────
+def _guess_ja_pos(word: str) -> str:
+    w = (word or "").strip()
+    if not w:
+        return "noun"
+    if w.endswith(("する", "します", "したい", "した", "しない", "しよう")):
+        return "verb"
+    if re.search(r"(う|く|ぐ|す|つ|ぬ|む|ぶ|る)$", w):
+        return "verb"
+    if w.endswith("い"):
+        return "iadj"
+    if w.endswith(("的", "的な", "風")):
+        return "naadj"
+    if re.fullmatch(r"[ァ-ヶー]+", w):
+        return "noun"
+    return "noun"
+
+def _ja_template_fallback(word: str) -> str:
+    kind = _guess_ja_pos(word)
+    if kind == "verb":
+        return f"{word}ところです。"
+    if kind == "iadj":
+        return f"{word}ですね。"
+    if kind == "naadj":
+        return f"{word}だね。"
+    return f"{word}が必要です。"
+
+# ───────────────────────────────────────────────
+# 語彙ユーティリティ
+# ───────────────────────────────────────────────
+def _example_temp_for(lang_code: str) -> float:
+    return 0.20 if lang_code == "ja" else EX_TEMP_DEFAULT
+
+_WIDE_DASH = re.compile(r"[‐-‒–—]")
+
+def _contains_word_relaxed(word: str, cand: str, lang_code: str) -> bool:
+    """
+    ja/ko/zh は活用・派生・送り仮名差を許容して '含む' とみなす。
+    他言語は大文字小文字無視の単純部分一致。
+    """
+    if not word or not cand:
+        return False
+    t = _WIDE_DASH.sub("-", cand)
+
+    if lang_code in ("ja", "ko", "zh"):
+        w = word.strip()
+        # 完全一致/部分一致
+        if w in t:
+            return True
+        # JA: する動詞
+        if lang_code == "ja" and w.endswith("する"):
+            stem = w[:-2]
+            if stem and (stem in t or f"{stem}し" in t):
+                return True
+        # JA: 漢字2文字以上の連続一致
+        kanjis = "".join(ch for ch in w if "\u4e00" <= ch <= "\u9fff" or ch == "々")
+        if len(kanjis) >= 2 and kanjis in t:
+            return True
+        # KO: 하다 の語幹ゆる一致
+        if lang_code == "ko" and w.endswith("하다"):
+            base = w[:-2]
+            if base and base in t:
+                return True
+        # ZH: 了/著/过 の付随許容
+        if lang_code == "zh":
+            if w in t or (w + "了") in t or (w + "著") in t or (w + "过") in t:
+                return True
+        # 空白除去で再チェック
+        if w.replace(" ", "") and w.replace(" ", "") in t.replace(" ", ""):
+            return True
+        return False
+
+    # Latin 系：単純部分一致（大小無視）
+    return (word or "").lower() in t.lower()
+
+def _gen_example_sentence(word: str, lang_code: str, context_hint: str = "", difficulty: str | None = None) -> str:
+    lang_name = LANG_NAME.get(lang_code, "English")
+    ctx = (context_hint or "").strip()
+    rules = _lang_rules(lang_code)
+    system = {
+        "role": "system",
+        "content": (
+            "You write exactly ONE natural sentence. "
+            "No lists, no quotes, no emojis, no URLs. Keep it monolingual."
+        ),
+    }
+
+    # 難易度指示
+    level_line = f" CEFR {difficulty} level の難易度にしてください。" if difficulty else ""
+
+    if lang_code == "ja":
+        user = (
+            f"{rules} "
+            f"単語「{word}」を必ず含めて、日本語で自然な一文をちょうど1つだけ書いてください。"
+            "日常の簡単な状況を想定し、助詞の使い方を自然にしてください。"
+            "かっこ書きや翻訳注釈は不要です。英字は禁止。"
+            "可能であれば見出し語に近い形で使ってください（ただし不自然なら活用して構いません）。"
+            f"{level_line}"
+        )
+        if ctx:
+            user += f" シーンの文脈: {ctx}"
+
+    elif lang_code == "ko":
+        user = (
+            f"{rules} "
+            f"다음 단어를 반드시 포함하여 한국어로 자연스러운 문장을 정확히 1개만 쓰세요: {word} "
+            "대괄호나 번역 메모 금지. 영문자 사용 금지."
+            "가능하면 기본형에 가깝게 쓰되, 부자연스러우면 활용해도 됩니다."
+            f"{level_line}"
+        )
+        if ctx:
+            user += f" 장면 힌트: {ctx}"
+
+    elif lang_code == "zh":
+        user = (
+            f"{rules} "
+            f"必须包含该词，并只写一句自然的句子：{word}。"
+            "不要使用括号或翻译注释。不要使用拉丁字母。"
+            "若可能请使用词典形式，若不自然可以适度变化。"
+            f"{level_line}"
+        )
+        if ctx:
+            user += f" 场景提示：{ctx}"
+
+    else:
+        user = (
+            f"{rules} "
+            f"Write exactly ONE short, natural sentence in {lang_name} that uses the word: {word}. "
+            "Return ONLY the sentence. Prefer using the dictionary form if natural."
+            f"{level_line}"
+        )
+        if ctx:
+            user += f" Scene hint: {ctx}"
+
+    for _ in range(6):
+        try:
+            rsp = GPT.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[system, {"role": "user", "content": user}],
+                temperature=_example_temp_for(lang_code),
+                top_p=0.9,
+            )
+            raw = (rsp.choices[0].message.content or "").strip()
+        except Exception:
+            raw = ""
+        cand = _clean_strict(raw)
+        FALLBACK_STATS["example_attempts"] += 1
+        if not _monolingual_ok(cand, lang_code):
+            continue
+        valid = bool(cand) and _is_single_sentence(cand) and _fits_length(cand, lang_code)
+        try:
+            contains_word = _contains_word_relaxed(word, cand, lang_code)
+        except Exception:
+            contains_word = True
+        if valid and contains_word:
+            return _ensure_period_for_sentence(cand, lang_code)
+
+    # フェールセーフ（バックアップ例文）
+    FALLBACK_STATS["example_fallbacks"] += 1
+    if lang_code == "ja":
+        return _ja_template_fallback(word)
+    elif lang_code == "ko":
+        return _ensure_period_for_sentence(f"{word}를 연습해 봅시다", lang_code)
+    elif lang_code == "zh":
+        return _ensure_period_for_sentence(f"让我们练习{word}", lang_code)
+    elif lang_code == "es":
+        return _ensure_period_for_sentence(f"Practiquemos {word}", lang_code)
+    elif lang_code == "pt":
+        return _ensure_period_for_sentence(f"Vamos praticar {word}", lang_code)
+    elif lang_code == "fr":
+        return _ensure_period_for_sentence(f"Pratiquons {word}", lang_code)
+    elif lang_code == "id":
+        return _ensure_period_for_sentence(f"Ayo berlatih {word}", lang_code)
+    else:
+        return _ensure_period_for_sentence(f"Let's practice {word}", lang_code)
 
 def _extract_words(text: str, lang_code: str, n: int, banned: set[str]) -> list[str]:
     """
@@ -160,363 +547,10 @@ def _gen_more_words_excluding(theme_for_prompt: str, lang_code: str, need: int, 
         lines.append("Use ONLY the target script. Do not use Latin letters.")
     return "\n".join(lines)
 
-JP_CONV_LABEL = {
-    "en": "英会話", "ja": "日本語会話", "es": "スペイン語会話",
-    "pt": "ポルトガル語会話", "ko": "韓国語会話", "id": "インドネシア語会話",
-    "fr": "フランス語会話", "zh": "中国語会話",
-}
-
-with open(BASE / "combos.yaml", encoding="utf-8") as f:
-    COMBOS = yaml.safe_load(f)["combos"]
-
-def reset_temp():
-    if TEMP.exists():
-        rmtree(TEMP)
-    TEMP.mkdir(exist_ok=True)
-
-def sanitize_title(raw: str) -> str:
-    """
-    タイトルは“切らない”方針：
-      - 余計な番号・全角空白などのノイズだけ除去
-      - YouTube上限(100文字)は静かにカット（省略記号は付けない）
-    """
-    title = re.sub(r"^\s*(?:\d+\s*[.)]|[-•・])\s*", "", raw)  # 先頭の番号や記号
-    title = re.sub(r"[\s\u3000]+", " ", title).strip()       # 連続スペース正規化
-    return title[:100]  # ← 省略記号を付けず、静かに100文字で切る
-
-def _infer_title_lang(audio_lang: str, subs: list[str], combo: dict) -> str:
-    if "title_lang" in combo and combo["title_lang"]:
-        return combo["title_lang"]
-    if len(subs) >= 2:
-        return subs[1]
-    for s in subs:
-        if s != audio_lang:
-            return s
-    return audio_lang
-
-def resolve_topic(arg_topic: str) -> str:
-    return arg_topic
-
-# ───────────────────────────────────────────────
-# クリーニング・バリデーション
-# ───────────────────────────────────────────────
-_URL_RE   = re.compile(r"https?://\S+")
-_NUM_LEAD = re.compile(r"^\s*\d+[\).:\-]\s*")
-_QUOTES   = re.compile(r'^[\"“”\']+|[\"“”\']+$')
-_EMOJI_RE = re.compile(r"[\U00010000-\U0010ffff]")
-_SENT_END = re.compile(r"[。.!?！？]")
-
-def _normalize_spaces(t: str) -> str:
-    return re.sub(r"\s+", " ", (t or "")).strip()
-
-def _clean_strict(text: str) -> str:
-    t = (text or "").strip()
-    t = _URL_RE.sub("", t)
-    t = _NUM_LEAD.sub("", t)
-    t = _QUOTES.sub("", t)
-    t = _EMOJI_RE.sub("", t)
-    t = re.sub(r"[\:\-–—]\s*$", "", t)
-    return _normalize_spaces(t)
-
-def _is_single_sentence(text: str) -> bool:
-    return len(_SENT_END.findall(text or "")) <= 1
-
-def _fits_length(text: str, lang_code: str) -> bool:
-    if lang_code in ("ja", "ko", "zh"):
-        return len(text or "") <= 30
-    return len(re.findall(r"\b\w+\b", text or "")) <= 12
-
-def _ensure_period_for_sentence(txt: str, lang_code: str) -> str:
-    t = txt or ""
-    return t if re.search(r"[。.!?！？]$", t) else t + ("。" if lang_code == "ja" else ".")
-
-def _clean_sub_line(text: str, lang_code: str) -> str:
-    t = _clean_strict(text).replace("\n", " ").strip()
-    m = _SENT_END.search(t)
-    if m:
-        t = t[:m.end()]
-    return t
-
-# ───────────────────────────────────────────────
-# モノリンガル強制（ko/ja/zhは英字禁止）
-# ───────────────────────────────────────────────
-_ASCII_LETTERS = re.compile(r"[A-Za-z]")
-
-def _monolingual_ok(text: str, lang_code: str) -> bool:
-    """ko/ja/zh は英字を含まないこと。その他は自由（Latin系言語のため）。"""
-    if lang_code in ("ko", "ja", "zh"):
-        return not _ASCII_LETTERS.search(text or "")
-    return True
-
-# TTS直前の非英語アスキー除去（安全側）
-def _purge_ascii_for_tts(text: str, lang_code: str) -> str:
-    if lang_code in ("ko", "ja", "zh"):
-        # 連続英字（2文字以上）は削除。単独1文字も原則不要なので落とす。
-        t = re.sub(r"[A-Za-z]+", "", text or "")
-        t = re.sub(r"\s{2,}", " ", t).strip()
-        return t or (text or "")
-    return text or ""
-
-# 英語以外で紛れ込んだ英単語を弱める軽いフィルタ（既存互換）
-_LATIN_WORD_RE = re.compile(r"\b[A-Za-z]{3,}\b")
-def _clean_non_english_ascii(text: str, lang_code: str) -> str:
-    if lang_code == "en":
-        return text
-    if lang_code in ("ko", "ja", "zh"):
-        # ko/ja/zh は完全除去を優先
-        return _purge_ascii_for_tts(text, lang_code)
-    t = text
-    t = _LATIN_WORD_RE.sub("", t)
-    t = re.sub(r"\s{2,}", " ", t).strip()
-    return t or text
-
-# ───────────────────────────────────────────────
-# 日本語TTS最適化
-# ───────────────────────────────────────────────
-_KANJI_ONLY = re.compile(r"^[一-龥々]+$")
-_PARENS_JA  = re.compile(r"\s*[\(\（][^)\）]{1,40}[\)\）]\s*")
-
-def _to_kanji_digits(num_str: str) -> str:
-    table = str.maketrans("0123456789", "〇一二三四五六七八九")
-    return num_str.translate(table)
-
-def normalize_ja_for_tts(text: str) -> str:
-    t = text or ""
-    t = re.sub(r"[\(（][^)\）]{1,40}[\)）]", "", t)
-    t = t.replace("/", "、").replace("-", "、").replace(":", "、").replace("・ ・", "・")
-    t = re.sub(r"\d{1,}", lambda m: _to_kanji_digits(m.group(0)), t)
-    t = re.sub(r"([A-Za-z]{2,})", lambda m: "・".join(list(m.group(1).lower())), t)
-    t = re.sub(r"[。]{2,}", "。", t)
-    t = re.sub(r"[、]{2,}", "、", t)
-    t = re.sub(r"\s{2,}", " ", t).strip()
-    if t and t[-1] not in "。！？!?":
-        t += "。"
-    return t
-
-# ───────────────────────────────────────────────
-# 翻訳強化
-# ───────────────────────────────────────────────
-_ASCII_ONLY = re.compile(r'^[\x00-\x7F]+$')
-
-def _looks_like_english(s: str) -> bool:
-    s = (s or "").strip()
-    return bool(_ASCII_ONLY.fullmatch(s)) and bool(re.search(r'[A-Za-z]', s))
-
-def _needs_retranslate(output: str, src_lang: str, target_lang: str, original: str) -> bool:
-    if target_lang == src_lang:
-        return False
-    out = (output or "").strip()
-    if not out:
-        return True
-    if out.lower() == (original or "").strip().lower():
-        return True
-    if target_lang == "en" and not _looks_like_english(out):
-        return True
-    return False
-
-def translate_sentence_strict(sentence: str, src_lang: str, target_lang: str) -> str:
-    try:
-        first = translate(sentence, target_lang)
-    except Exception:
-        first = ""
-    if not _needs_retranslate(first, src_lang, target_lang, sentence):
-        return _clean_sub_line(first, target_lang)
-    try:
-        rsp = GPT.chat_completions.create
-    except AttributeError:
-        pass
-    try:
-        rsp = GPT.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{
-                "role":"user",
-                "content":(
-                    f"Translate from {LANG_NAME.get(src_lang,'source language')} "
-                    f"to {LANG_NAME.get(target_lang,'target language')}.\n"
-                    "Return ONLY the translation as a single sentence. "
-                    "No explanations, no quotes, no extra symbols.\n\n"
-                    f"Text: {sentence}"
-                )
-            }],
-            temperature=0.0, top_p=1.0
-        )
-        out = (rsp.choices[0].message.content or "").strip()
-        out = _clean_sub_line(out, target_lang)
-        if out:
-            return out
-    except Exception:
-        pass
-    return _clean_sub_line(sentence, target_lang)
-
-# ───────────────────────────────────────────────
-# ラングエージルール（厳密モノリンガル）
-# ───────────────────────────────────────────────
-def _lang_rules(lang_code: str) -> str:
-    if lang_code == "ja":
-        return (
-            "Write entirely in Japanese. "
-            "Do not include Latin letters or other languages. "
-            "Avoid ASCII symbols such as '/', '-', '→', '()', '[]', '<>', and '|'. "
-            "No translation glosses, brackets, or country/language mentions."
-        )
-    if lang_code == "ko":
-        return (
-            "Write entirely in Korean (Hangul only). "
-            "Do not include Latin letters or other languages. "
-            "Avoid ASCII symbols such as '/', '-', '→', '()', '[]', '<>', and '|'. "
-            "No translation glosses or stage directions."
-        )
-    if lang_code == "zh":
-        return (
-            "Write entirely in Chinese. "
-            "Do not include Latin letters or other languages. "
-            "Avoid ASCII symbols such as '/', '-', '→', '()', '[]', '<>', and '|'. "
-            "No translation glosses or stage directions."
-        )
-    lang_name = LANG_NAME.get(lang_code, "English")
-    return (
-        f"Write entirely in {lang_name}. "
-        "Do not code-switch or include other writing systems. "
-        "Avoid ASCII symbols like '/', '-', '→', '()', '[]', '<>', and '|'. "
-        "No translation glosses, brackets, or country/language mentions."
-    )
-
-# ───────────────────────────────────────────────
-# 日本語 fallback
-# ───────────────────────────────────────────────
-def _guess_ja_pos(word: str) -> str:
-    w = (word or "").strip()
-    if not w:
-        return "noun"
-    if w.endswith(("する", "します", "したい", "した", "しない", "しよう")):
-        return "verb"
-    if re.search(r"(う|く|ぐ|す|つ|ぬ|む|ぶ|る)$", w):
-        return "verb"
-    if w.endswith("い"):
-        return "iadj"
-    if w.endswith(("的", "的な", "風")):
-        return "naadj"
-    if re.fullmatch(r"[ァ-ヶー]+", w):
-        return "noun"
-    return "noun"
-
-def _ja_template_fallback(word: str) -> str:
-    kind = _guess_ja_pos(word)
-    if kind == "verb":
-        return f"{word}ところです。"
-    if kind == "iadj":
-        return f"{word}ですね。"
-    if kind == "naadj":
-        return f"{word}だね。"
-    return f"{word}が必要です。"
-
-# ───────────────────────────────────────────────
-# 語彙ユーティリティ
-# ───────────────────────────────────────────────
-def _example_temp_for(lang_code: str) -> float:
-    return 0.20 if lang_code == "ja" else EX_TEMP_DEFAULT
-
-def _gen_example_sentence(word: str, lang_code: str, context_hint: str = "", difficulty: str | None = None) -> str:
-    lang_name = LANG_NAME.get(lang_code, "English")
-    ctx = (context_hint or "").strip()
-    rules = _lang_rules(lang_code)
-    system = {
-        "role": "system",
-        "content": (
-            "You write exactly ONE natural sentence. "
-            "No lists, no quotes, no emojis, no URLs. Keep it monolingual."
-        ),
-    }
-
-    # 難易度指示を追加
-    level_line = f" CEFR {difficulty} level の難易度にしてください。" if difficulty else ""
-
-    if lang_code == "ja":
-        user = (
-            f"{rules} "
-            f"単語「{word}」を必ず含めて、日本語で自然な一文をちょうど1つだけ書いてください。"
-            "日常の簡単な状況を想定し、助詞の使い方を自然にしてください。"
-            "かっこ書きや翻訳注釈は不要です。英字は禁止。"
-            f"{level_line}"
-        )
-        if ctx:
-            user += f" シーンの文脈: {ctx}"
-
-    elif lang_code == "ko":
-        user = (
-            f"{rules} "
-            f"다음 단어를 반드시 포함하여 한국어로 자연스러운 문장을 정확히 1개만 쓰세요: {word} "
-            "대괄호나 번역 메モ 금지. 영문자使用 금지."
-            f"{level_line}"
-        )
-        if ctx:
-            user += f" 장면 힌트: {ctx}"
-
-    elif lang_code == "zh":
-        user = (
-            f"{rules} "
-            f"必须包含该词，且只写一句自然的{LANG_NAME.get(lang_code)}句子：{word}。"
-            "不要使用括号或翻译注释。不要使用拉丁字母。"
-            f"{level_line}"
-        )
-        if ctx:
-            user += f" 场景提示：{ctx}"
-
-    else:
-        user = (
-            f"{rules} "
-            f"Write exactly ONE short, natural sentence in {lang_name} that uses the word: {word}. "
-            "Return ONLY the sentence."
-            f"{level_line}"
-        )
-        if ctx:
-            user += f" Scene hint: {ctx}"
-
-    for _ in range(6):
-        try:
-            rsp = GPT.chat_completions.create(
-                model="gpt-4o-mini",
-                messages=[system, {"role": "user", "content": user}],
-                temperature=_example_temp_for(lang_code),
-                top_p=0.9,
-            )
-            raw = (rsp.choices[0].message.content or "").strip()
-        except Exception:
-            raw = ""
-        cand = _clean_strict(raw)
-        if not _monolingual_ok(cand, lang_code):
-            continue
-        valid = bool(cand) and _is_single_sentence(cand) and _fits_length(cand, lang_code)
-        try:
-            contains_word = (word.lower() in cand.lower()) if lang_code not in ("ja", "ko", "zh") else (word in cand)
-        except Exception:
-            contains_word = True
-        if valid and contains_word:
-            return _ensure_period_for_sentence(cand, lang_code)
-
-    # フェールセーフ（バックアップ例文）
-    if lang_code == "ja":
-        return _ja_template_fallback(word)
-    elif lang_code == "ko":
-        return _ensure_period_for_sentence(f"{word}를 연습해 봅시다", lang_code)
-    elif lang_code == "zh":
-        return _ensure_period_for_sentence(f"让我们练习{word}", lang_code)
-    elif lang_code == "es":
-        return _ensure_period_for_sentence(f"Practiquemos {word}", lang_code)
-    elif lang_code == "pt":
-        return _ensure_period_for_sentence(f"Vamos praticar {word}", lang_code)
-    elif lang_code == "fr":
-        return _ensure_period_for_sentence(f"Pratiquons {word}", lang_code)
-    elif lang_code == "id":
-        return _ensure_period_for_sentence(f"Ayo berlatih {word}", lang_code)
-    else:
-        return _ensure_period_for_sentence(f"Let's practice {word}", lang_code)
-
 def _gen_vocab_list(theme: str, lang_code: str, n: int) -> list[str]:
     """
     汎用：強プロンプト → 厳密パース → 不足分だけ再生成 → 最後にフォールバック。
     """
-    # 1) 生成プロンプト
     theme_for_prompt = translate(theme, lang_code) if lang_code != "en" else theme
     lang_name = LANG_NAME.get(lang_code, "the target language")
     banned = _banned_for(lang_code)
@@ -530,7 +564,6 @@ def _gen_vocab_list(theme: str, lang_code: str, n: int) -> list[str]:
     )
 
     content = ""
-    # 2) リトライ（最大3回）
     for attempt in range(3):
         try:
             rsp = GPT.chat.completions.create(
@@ -547,7 +580,6 @@ def _gen_vocab_list(theme: str, lang_code: str, n: int) -> list[str]:
 
     words = _extract_words(content, lang_code, n, banned=banned)
 
-    # 3) 不足分があれば追加生成（exclude 指定）
     if len(words) < n:
         need = n - len(words)
         prompt2 = _gen_more_words_excluding(theme_for_prompt, lang_code, need, exclude=words, diff_hint="")
@@ -568,7 +600,6 @@ def _gen_vocab_list(theme: str, lang_code: str, n: int) -> list[str]:
         more = _extract_words(content2, lang_code, need, banned=banned | set(words))
         words.extend([w for w in more if w not in words])
 
-    # 4) まだ足りなければ最小フォールバック（既出/バン除外）
     if len(words) < n:
         FALLBACKS = {
             "ja": ["清掃", "鍵", "フロント", "支払い", "荷物", "朝食", "通路", "館内", "地図", "案内"],
@@ -606,7 +637,6 @@ def _gen_vocab_list_from_spec(spec: dict, lang_code: str) -> list[str]:
     lang_name = LANG_NAME.get(lang_code, "the target language")
     banned = _banned_for(lang_code)
 
-    # 1) 強プロンプト
     lines = [
         f"You are selecting {n} HIGH-FREQUENCY words for the topic: {theme_for_prompt}.",
         f"Language: {lang_name}. Return ONLY one word (or short hyphenated term) per line, no numbering.",
@@ -651,7 +681,6 @@ def _gen_vocab_list_from_spec(spec: dict, lang_code: str) -> list[str]:
 
     words = _extract_words(content, lang_code, n, banned=banned)
 
-    # 2) 不足分：「不足分だけ」再生成（exclude=既得＋バン）
     if len(words) < n:
         need = n - len(words)
         prompt2 = _gen_more_words_excluding(theme_for_prompt, lang_code, need, exclude=words, diff_hint=diff if diff in ("A1","A2","B1","B2") else "")
@@ -672,7 +701,6 @@ def _gen_vocab_list_from_spec(spec: dict, lang_code: str) -> list[str]:
         more = _extract_words(content2, lang_code, need, banned=banned | set(words))
         words.extend([w for w in more if w not in words])
 
-    # 3) それでも足りなければ、最後に控えめフォールバック
     if len(words) < n:
         return _gen_vocab_list(th, lang_code, n)
     return words[:n]
@@ -808,13 +836,11 @@ def _gen_conversation_using_words(words: list[str], lang_code: str, lines_per_ro
         if raw and _monolingual_ok(raw, lang_code):
             break
 
-    # 行に分解（空行除去）して所定数に丸める
     lines = [ln.strip() for ln in (raw or "").splitlines() if ln.strip()]
     if len(lines) < lines_per_round:
         lines += (lines[-1:] * (lines_per_round - len(lines))) if lines else [""] * lines_per_round
     lines = lines[:lines_per_round]
 
-    # 句点を補い、最終整形
     fixed = []
     for t in lines:
         t = _clean_strict(t)
@@ -822,7 +848,6 @@ def _gen_conversation_using_words(words: list[str], lang_code: str, lines_per_ro
             t = _purge_ascii_for_tts(t, lang_code)
         fixed.append(_ensure_period_for_sentence(t, lang_code))
 
-    # Alice/Bob を交互に付与
     out: list[tuple[str, str]] = []
     for i, t in enumerate(fixed):
         spk = "Alice" if i % 2 == 0 else "Bob"
@@ -854,8 +879,8 @@ def _pick_unique_words(theme: str, audio_lang: str, n: int, base_spec: dict | No
     if len(words) < n:
         FALLBACKS = {
             "ja": ["チェックイン", "予約", "チェックアウト", "領収書", "エレベーター", "ロビー", "アップグレード", "領域", "清掃"],
-            "ko": ["체크인", "예약", "체크아웃", "영수증", "엘리베ーター", "로비", "업그레이드", "청소", "객실"],
-            "zh": ["办理入住", "预订", "退房", "发票", "电梯", "大堂", "升级", "清扫", "房间"],
+            "ko": ["체크인", "예약", "체크아웃", "영수증", "엘리베이터", "로비", "업그레이드", "청소", "객실"],
+            "zh": ["办理入住", "预订", "退房", "发票", "电梯", "大堂", "升级", "房间"],
             "es": ["registro", "reserva", "salida", "recibo", "ascensor", "vestíbulo", "mejora"],
             "pt": ["check-in", "reserva", "checkout", "recibo", "elevador", "saguão", "upgrade"],
             "fr": ["enregistrement", "réservation", "départ", "reçu", "ascenseur", "hall", "surclassement"],
@@ -965,7 +990,8 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
                 if key not in seen_words and not (audio_lang in ("ko","ja","zh") and _ASCII_LETTERS.search(w)):
                     pool.append(w)
             if len(pool) < VOCAB_WORDS:
-                pool.extend(_pick_unique_words(master_theme, audio_lang, VOCAB_WORDS - len(pool), base_spec, seen_words=set()))
+                # ★ 修正：既存 seen_words を渡して、他ラウンドとの重複を防止
+                pool.extend(_pick_unique_words(master_theme, audio_lang, VOCAB_WORDS - len(pool), base_spec, seen_words=seen_words))
             words_round = pool[:VOCAB_WORDS]
             for w in words_round:
                 key = w.lower() if audio_lang not in ("ja","ko","zh") else w
@@ -973,10 +999,15 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
         else:
             words_round = _pick_unique_words(master_theme, audio_lang, VOCAB_WORDS, base_spec, seen_words)
 
+        # 保険：このラウンド確定語を即時 seen に（デバッグログも）
+        for _w in words_round:
+            _key = _w.lower() if audio_lang not in ("ja","ko","zh") else _w
+            if _key in seen_words:
+                logging.info(f"[DEDUP] skip-dup {_w}")
+            seen_words.add(_key)
+
         # 2) 単語→単語→例文（×N語）
         round_examples: list[str] = []
-
-        # topic_picker.py で作られた spec の中に difficulty があるはず
         difficulty_for_this = spec.get("difficulty") if isinstance(spec, dict) else None
 
         for w in words_round:
@@ -1001,7 +1032,6 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
                     tts_line = normalize_ja_for_tts(tts_line)
                 else:
                     tts_line = _ensure_period_for_sentence(tts_line, audio_lang)
-                # ko/ja/zh は英字を落とす
                 if audio_lang in ("ko","ja","zh"):
                     tts_line = _purge_ascii_for_tts(tts_line, audio_lang)
                 else:
@@ -1066,7 +1096,7 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
                         trans = line
                     sub_rows[r].append(_clean_sub_line(trans, lang))
 
-        # 3) まとめ会話（このラウンドの語を全部使う）→ ラウンドごとに挿入
+        # 3) まとめ会話（このラウンドの語を全部使う）
         convo = _gen_conversation_using_words(words_round, audio_lang, lines_per_round=CONVO_LINES)
         for spk, line in convo:
             if audio_lang == "ja":
@@ -1140,6 +1170,9 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
                 total += d
                 f.write(f"{i:02d}\t{d:.3f}s\n")
             f.write(f"TOTAL\t{total:.3f}s\n")
+        # 例文フォールバック統計
+        with open(TEMP / "fallback_stats.json", "w", encoding="utf-8") as f:
+            json.dump(FALLBACK_STATS, f, ensure_ascii=False, indent=2)
     except Exception as e:
         logging.warning(f"[DEBUG_SCRIPT] write failed: {e}")
 
@@ -1171,13 +1204,82 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
         return
 
     # ───────────────────────────── メタ生成＆アップロード ─────────────────────────────
-    # ※ INCLUDE_VOCAB_IN_TITLE / SERIES_LABELS はグローバル定義を使用
+    INCLUDE_VOCAB_IN_TITLE = os.getenv("TITLE_VOCAB", "0") == "1"
+    SERIES_LABELS = {
+        "en": "Real Practice Series",
+        "ja": "Real Practice シリーズ",
+        "ko": "Real Practice 시리즈",
+        "zh": "Real Practice 系列",
+        "es": "Serie Real Practice",
+        "pt": "Série Real Practice",
+        "fr": "Série Real Practice",
+        "id": "Seri Real Practice",
+    }
 
-    # ===== Title/Desc/Tags =====
-    # pos_for_all / difficulty_for_all は run_one 内の値をそのまま使用
+    def make_title(theme, title_lang: str, audio_lang_for_label: str | None = None,
+                   pos: list[str] | None = None, difficulty: str | None = None,
+                   pattern_hint: str | None = None):
+        """
+        形式：「<翻訳済みTopic>[ 語彙/Vocabulary] | <シリーズ名> (A2)」
+        “見切れ対策の手動クリップ”は廃止。100文字上限だけ sanitize_title() に委ねる。
+        """
+        level = (difficulty or "A2").upper()
+        series_name = SERIES_LABELS.get(title_lang, "Real Practice Series")
+        try:
+            theme_local = theme if title_lang == "en" else translate(theme, title_lang)
+        except Exception:
+            theme_local = theme
+
+        if title_lang == "ja":
+            topic_part = f"{theme_local} 語彙" if INCLUDE_VOCAB_IN_TITLE else f"{theme_local}"
+        else:
+            topic_part = f"{theme_local} Vocabulary" if INCLUDE_VOCAB_IN_TITLE else f"{theme_local}"
+
+        title_raw = f"{topic_part} | {series_name} ({level})"
+        return sanitize_title(title_raw)
+
+    def make_desc(theme, title_lang: str):
+        if title_lang not in LANG_NAME:
+            title_lang = "en"
+        try:
+            theme_local = theme if title_lang == "en" else translate(theme, title_lang)
+        except Exception:
+            theme_local = theme
+        msg = {
+            "ja": f"{theme_local} に必須の語彙を短時間でチェック。声に出して一緒に練習しよう！ #vocab #learning",
+            "en": f"Quick practice for {theme_local} vocabulary. Repeat after the audio! #vocab #learning",
+            "pt": f"Pratique rápido o vocabulário de {theme_local}. Repita em voz alta! #vocab #aprendizado",
+            "es": f"Práctica rápida de vocabulario de {theme_local}. ¡Repite en voz alta! #vocab #aprendizaje",
+            "ko": f"{theme_local} 어휘를 빠르게 연습하세요. 소리 내어 따라 말해요! #vocab #learning",
+            "id": f"Latihan cepat kosakata {theme_local}. Ucapkan keras-keras! #vocab #belajar",
+            "fr": f"Entraînement rapide du vocabulaire {theme_local}. Répétez à voix haute ! #vocab #apprentissage",
+            "zh": f"快速练习 {theme_local} 词汇。跟着音频大声练习！ #vocab #learning",
+        }
+        return msg.get(title_lang, msg["en"])
+
+    def make_tags(theme, audio_lang, subs, title_lang, difficulty=None, pos=None):
+        tags = [
+            theme, "vocabulary", "language learning", "speaking practice",
+            "listening practice", "subtitles"
+        ]
+        if difficulty:
+            tags.append(f"CEFR {difficulty}")
+        if pos:
+            for p in pos:
+                tags.append(p)
+        for code in subs:
+            if code in LANG_NAME:
+                tags.append(f"{LANG_NAME[code]} subtitles")
+        seen_t, out = set(), []
+        for t in tags:
+            if t not in seen_t:
+                seen_t.add(t)
+                out.append(t)
+        return out[:15]
+
     pos_for_title = pos_for_all
     difficulty_for_title = difficulty_for_all
-    pattern_for_title = pattern_for_all  # 現状未使用だが引数として受けておく
+    pattern_for_title = pattern_for_all
 
     title = make_title(
         master_theme, title_lang, audio_lang_for_label=audio_lang,
@@ -1187,7 +1289,6 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
     tags  = make_tags(master_theme, audio_lang, subs, title_lang,
                       difficulty=difficulty_for_title, pos=pos_for_title)
 
-    # アップロード（リトライ/フォールバック）
     def _is_limit_error(err: Exception) -> bool:
         s = str(err)
         return ("uploadLimitExceeded" in s or "quotaExceeded" in s or
@@ -1235,80 +1336,6 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
         return False
 
     _try_upload_with_fallbacks()
-
-# ───────────────────────────────────────────────
-# タイトル関連（グローバル関数としてネスト解除）
-# ───────────────────────────────────────────────
-def make_title(theme, title_lang: str, audio_lang_for_label: str | None = None,
-               pos: list[str] | None = None, difficulty: str | None = None,
-               pattern_hint: str | None = None) -> str:
-    """
-    方針：
-      - 形式は「<翻訳済みTopic>[ 語彙/Vocabulary] | <シリーズ名> (A2)」に統一
-      - “見切れ対策の手動クリップ”は廃止（UI側で省略表示されても、コードでは切らない）
-      - 最終的な100文字制限だけ sanitize_title() に委ねる
-    """
-    level = (difficulty or "A2").upper()
-
-    # 言語別シリーズ名
-    series_name = SERIES_LABELS.get(title_lang, "Real Practice Series")
-
-    # テーマ翻訳
-    try:
-        theme_local = theme if title_lang == "en" else translate(theme, title_lang)
-    except Exception:
-        theme_local = theme
-
-    # Vocabulary の挿入（ENV: TITLE_VOCAB=1）
-    if title_lang == "ja":
-        topic_part = f"{theme_local} 語彙" if INCLUDE_VOCAB_IN_TITLE else f"{theme_local}"
-    else:
-        topic_part = f"{theme_local} Vocabulary" if INCLUDE_VOCAB_IN_TITLE else f"{theme_local}"
-
-    # 最終タイトル（ここでは一切クリップしない）
-    title_raw = f"{topic_part} | {series_name} ({level})"
-
-    # 余計な整形＋100文字上限だけ静かに適用
-    return sanitize_title(title_raw)
-
-def make_desc(theme, title_lang: str) -> str:
-    if title_lang not in LANG_NAME:
-        title_lang = "en"
-    try:
-        theme_local = theme if title_lang == "en" else translate(theme, title_lang)
-    except Exception:
-        theme_local = theme
-    msg = {
-        "ja": f"{theme_local} に必須の語彙を短時間でチェック。声に出して一緒に練習しよう！ #vocab #learning",
-        "en": f"Quick practice for {theme_local} vocabulary. Repeat after the audio! #vocab #learning",
-        "pt": f"Pratique rápido o vocabulário de {theme_local}. Repita em voz alta! #vocab #aprendizado",
-        "es": f"Práctica rápida de vocabulario de {theme_local}. ¡Repite en voz alta! #vocab #aprendizaje",
-        "ko": f"{theme_local} 어휘를 빠르게 연습하세요. 소리 내어 따라 말해요! #vocab #learning",
-        "id": f"Latihan cepat kosakata {theme_local}. Ucapkan keras-keras! #vocab #belajar",
-        "fr": f"Entraînement rapide du vocabulaire {theme_local}. Répétez à voix haute ! #vocab #apprentissage",
-        "zh": f"快速练习 {theme_local} 词汇。跟着音频大声练习！ #vocab #learning",
-    }
-    return msg.get(title_lang, msg["en"])
-
-def make_tags(theme, audio_lang, subs, title_lang, difficulty=None, pos=None):
-    tags = [
-        theme, "vocabulary", "language learning", "speaking practice",
-        "listening practice", "subtitles"
-    ]
-    if difficulty:
-        tags.append(f"CEFR {difficulty}")
-    if pos:
-        for p in pos:
-            tags.append(p)
-    for code in subs:
-        if code in LANG_NAME:
-            tags.append(f"{LANG_NAME[code]} subtitles")
-    seen, out = set(), []
-    for t in tags:
-        if t not in seen:
-            seen.add(t)
-            out.append(t)
-    return out[:15]
 
 # ───────────────────────────────────────────────
 def run_all(topic, turns, privacy, do_upload, chunk_size):

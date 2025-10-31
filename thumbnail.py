@@ -1,4 +1,4 @@
-# thumbnail.py – Landscape thumbnail (scene | phrase), centered glass panel + branding (VISUAL ENHANCED)
+# thumbnail.py – Landscape thumbnail (scene | phrase), centered glass panel + branding (VISUAL ENHANCED, FIXED)
 from pathlib import Path
 from io import BytesIO
 import textwrap, logging, requests, random, os
@@ -112,7 +112,7 @@ def _unsplash(topic: str) -> Image.Image:
     # 横向き 1920x1080 に黒帯なしでフィット
     img = ImageOps.fit(img, (W, H), Image.LANCZOS, centering=(0.5, 0.5))
     img = img.filter(ImageFilter.GaussianBlur(1.4)).convert("RGBA")
-    # 30% veil for text contrast（横は少し弱め）
+    # 30% veil for text contrast
     img.alpha_composite(Image.new("RGBA", (W, H), (0, 0, 0, 80)))
     return img
 
@@ -175,8 +175,8 @@ def _stroke_for(font_px: int) -> int:
     # フォントサイズに比例したアウトライン太さ（最小2px）
     return max(2, int(round(font_px * 0.05)))
 
-def _vignette(alpha_strength=0.26):
-    # 周辺減光（黒の放射状グラデーション）
+def _vignette(alpha_strength=0.26) -> Image.Image:
+    """周辺減光（黒の放射状グラデーション）RGBA画像を返す"""
     v = Image.new("L", (W, H), 0)
     cx, cy = W / 2, H / 2
     maxd = (cx**2 + cy**2) ** 0.5
@@ -186,16 +186,20 @@ def _vignette(alpha_strength=0.26):
             d = ((x - cx) ** 2 + (y - cy) ** 2) ** 0.5 / maxd
             a = int(max(0, min(255, (d ** 1.7) * 255 * alpha_strength)))
             px[x, y] = a
-    return Image.merge("RGBA", (Image.new("L", (W, H), 0),)*3 + (v,))
+    # ★ ここを安全なタプル結合に修正
+    rgb_layers = [Image.new("L", (W, H), 0)] * 3
+    return Image.merge("RGBA", tuple(rgb_layers + [v]))
 
-def _light_flow(alpha_max=48):
-    # 右へ行くほど僅かに明るくなる横グラデ
+def _light_flow(alpha_max=48) -> Image.Image:
+    """右へ行くほど僅かに明るくなる横グラデRGBA画像を返す"""
     grad = Image.new("L", (W, 1))
     for x in range(W):
         val = int(alpha_max * (x / W))  # 0 → alpha_max
         grad.putpixel((x, 0), val)
     g = grad.resize((W, H))
-    return Image.merge("RGBA", (Image.new("L", (W, H), 255),)*3 + (g,))
+    # ★ ここも安全なタプル結合に修正
+    rgb_layers = [Image.new("L", (W, H), 255)] * 3
+    return Image.merge("RGBA", tuple(rgb_layers + [g]))
 
 def _tone_grade(img: Image.Image) -> Image.Image:
     # Deep-Green × Gold のブランド調に軽く統一
@@ -284,7 +288,7 @@ def _draw(img: Image.Image, cap: str, badge_txt: str, lang_code: str) -> Image.I
     for y in range(ph):
         alpha = int(64 + 24 * (1 - abs((y - ph/2) / (ph/2))))
         grad.putpixel((0, y), alpha)
-    veil = Image.merge("RGBA", (Image.new("L",(pw,ph),255),)*3 + (grad.resize((pw, ph))))
+    veil = Image.merge("RGBA", (Image.new("L",(pw,ph),255),)*3 + (grad.resize((pw, ph)),))
     panel = Image.alpha_composite(panel_bg, veil)
 
     mask = Image.new("L", (pw, ph), 0)

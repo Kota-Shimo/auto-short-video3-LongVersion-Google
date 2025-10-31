@@ -48,7 +48,7 @@ EX_TEMP_DEFAULT = float(os.getenv("EX_TEMP", "0.35"))   # 例文
 LIST_TEMP       = float(os.getenv("LIST_TEMP", "0.30")) # 語彙リスト
 
 # 語彙・ラウンド
-VOCAB_WORDS   = int(os.getenv("VOCAB_WORDS", "2"))      # 1ラウンドの単語数（試験を楽に）
+VOCAB_WORDS   = int(os.getenv("VOCAB_WORDS", "2"))      # 1ラウンドの単語数
 VOCAB_ROUNDS  = int(os.getenv("VOCAB_ROUNDS", "2"))     # ラウンド数
 CONVO_LINES   = int(os.getenv("CONVO_LINES", "2"))      # そのラウンド末の会話行数（偶数推奨）
 
@@ -62,10 +62,23 @@ LANG_NAME = {
     "zh": "Chinese",
 }
 
+# ====== Title policy globals (外出ししてスコープ不一致を解消) ======
+INCLUDE_VOCAB_IN_TITLE = os.getenv("TITLE_VOCAB", "0") == "1"
+SERIES_LABELS = {
+    "en": "Real Practice Series",
+    "ja": "Real Practice シリーズ",
+    "ko": "Real Practice 시리즈",
+    "zh": "Real Practice 系列",
+    "es": "Serie Real Practice",
+    "pt": "Série Real Practice",
+    "fr": "Série Real Practice",
+    "id": "Seri Real Practice",
+}
+
 # ====== Common “too-safe” words to avoid (language-specific) ======
 BANNED_COMMON_BY_LANG = {
     "ja": {"チェックイン", "チェックアウト", "予約", "領収書", "レシート", "ロビー", "エレベーター", "アップグレード", "客室", "部屋"},
-    "ko": {"체크인", "체크아웃", "예약", "영수증", "로비", "엘리베이터", "업그레이드", "객실"},
+    "ko": {"체크인", "체크아웃", "예약", "영수증", "로비", "엘리ベ이터", "업그레이드", "객실"},
     "zh": {"办理入住", "退房", "预订", "发票", "大堂", "电梯", "升级", "房间"},
     "es": {"registro", "reserva", "salida", "recibo", "ascensor", "vestíbulo", "mejora"},
     "pt": {"check-in", "reserva", "checkout", "recibo", "elevador", "saguão", "upgrade"},
@@ -106,7 +119,6 @@ def _extract_words(text: str, lang_code: str, n: int, banned: set[str]) -> list[
         else:
             # Latin系は1トークン化（hyphenは許容）
             token = ln.split()[0]
-            # 記号で終端するものを軽く除去
             token = re.sub(r"[^\w\-’']", "", token)
             w = token
 
@@ -171,7 +183,7 @@ def sanitize_title(raw: str) -> str:
     title = re.sub(r"^\s*(?:\d+\s*[.)]|[-•・])\s*", "", raw)  # 先頭の番号や記号
     title = re.sub(r"[\s\u3000]+", " ", title).strip()       # 連続スペース正規化
     return title[:100]  # ← 省略記号を付けず、静かに100文字で切る
-    
+
 def _infer_title_lang(audio_lang: str, subs: list[str], combo: dict) -> str:
     if "title_lang" in combo and combo["title_lang"]:
         return combo["title_lang"]
@@ -434,7 +446,7 @@ def _gen_example_sentence(word: str, lang_code: str, context_hint: str = "", dif
         user = (
             f"{rules} "
             f"다음 단어를 반드시 포함하여 한국어로 자연스러운 문장을 정확히 1개만 쓰세요: {word} "
-            "대괄호나 번역 메모 금지. 영문자 사용 금지."
+            "대괄호나 번역 메モ 금지. 영문자使用 금지."
             f"{level_line}"
         )
         if ctx:
@@ -462,7 +474,7 @@ def _gen_example_sentence(word: str, lang_code: str, context_hint: str = "", dif
 
     for _ in range(6):
         try:
-            rsp = GPT.chat.completions.create(
+            rsp = GPT.chat_completions.create(
                 model="gpt-4o-mini",
                 messages=[system, {"role": "user", "content": user}],
                 temperature=_example_temp_for(lang_code),
@@ -499,12 +511,12 @@ def _gen_example_sentence(word: str, lang_code: str, context_hint: str = "", dif
         return _ensure_period_for_sentence(f"Ayo berlatih {word}", lang_code)
     else:
         return _ensure_period_for_sentence(f"Let's practice {word}", lang_code)
-        
+
 def _gen_vocab_list(theme: str, lang_code: str, n: int) -> list[str]:
     """
     汎用：強プロンプト → 厳密パース → 不足分だけ再生成 → 最後にフォールバック。
     """
-    # 1) 生成プロンプト（明確化：言語/スクリプト/CEFRはここでは未指定）
+    # 1) 生成プロンプト
     theme_for_prompt = translate(theme, lang_code) if lang_code != "en" else theme
     lang_name = LANG_NAME.get(lang_code, "the target language")
     banned = _banned_for(lang_code)
@@ -514,11 +526,11 @@ def _gen_vocab_list(theme: str, lang_code: str, n: int) -> list[str]:
         f"Language: {lang_name}. Return ONLY one word per line, no numbering.\n"
         "No explanations. No examples. No punctuation."
         + ("\nUse ONLY the target script (no Latin letters)." if lang_code in ("ko","ja","zh") else "")
-        + ("\nAvoid over-generic hotel words such as check-in / reservation equivalents." )
+        + ("\nAvoid over-generic hotel words such as check-in / reservation equivalents.")
     )
 
     content = ""
-    # 2) リトライ（最大3回、温度を微増、軽いバックオフ）
+    # 2) リトライ（最大3回）
     for attempt in range(3):
         try:
             rsp = GPT.chat.completions.create(
@@ -528,14 +540,14 @@ def _gen_vocab_list(theme: str, lang_code: str, n: int) -> list[str]:
                 top_p=0.9,
             )
             content = (rsp.choices[0].message.content or "")
-        except Exception as e:
+        except Exception:
             content = ""
         if content and content.strip():
             break
 
     words = _extract_words(content, lang_code, n, banned=banned)
 
-    # 3) 不足分があれば「不足分だけ」再生成（除外リスト明示）
+    # 3) 不足分があれば追加生成（exclude 指定）
     if len(words) < n:
         need = n - len(words)
         prompt2 = _gen_more_words_excluding(theme_for_prompt, lang_code, need, exclude=words, diff_hint="")
@@ -577,7 +589,7 @@ def _gen_vocab_list(theme: str, lang_code: str, n: int) -> list[str]:
                 words.append(fw)
 
     return words[:n]
-    
+
 def _gen_vocab_list_from_spec(spec: dict, lang_code: str) -> list[str]:
     """
     spec（theme/context/pos/relation_mode/difficulty/pattern_hint）を尊重して語彙抽出。
@@ -664,9 +676,6 @@ def _gen_vocab_list_from_spec(spec: dict, lang_code: str) -> list[str]:
     if len(words) < n:
         return _gen_vocab_list(th, lang_code, n)
     return words[:n]
-
-    # 言語別フォールバック
-    return _gen_vocab_list(th, lang_code, n)
 
 # ───────────────────────────────────────────────
 # 日本語TTS用ふりがな（単語が漢字のみの時）
@@ -845,7 +854,7 @@ def _pick_unique_words(theme: str, audio_lang: str, n: int, base_spec: dict | No
     if len(words) < n:
         FALLBACKS = {
             "ja": ["チェックイン", "予約", "チェックアウト", "領収書", "エレベーター", "ロビー", "アップグレード", "領域", "清掃"],
-            "ko": ["체크인", "예약", "체크아웃", "영수증", "엘리베이터", "로비", "업그레이드", "청소", "객실"],
+            "ko": ["체크인", "예약", "체크아웃", "영수증", "엘리베ーター", "로비", "업그레이드", "청소", "객실"],
             "zh": ["办理入住", "预订", "退房", "发票", "电梯", "大堂", "升级", "清扫", "房间"],
             "es": ["registro", "reserva", "salida", "recibo", "ascensor", "vestíbulo", "mejora"],
             "pt": ["check-in", "reserva", "checkout", "recibo", "elevador", "saguão", "upgrade"],
@@ -1162,97 +1171,13 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
         return
 
     # ───────────────────────────── メタ生成＆アップロード ─────────────────────────────
-    # ====== Title policy (Long ver.) – Real Practice Series 統一 ======
-    # 環境変数で簡単トグル：
-    #   TITLE_VOCAB=1   → タイトルに「Vocabulary」を入れる（語彙ドリル回など）
-    #   SERIES_NAME     → 既定 "Real Practice Series" を上書き可能
-    INCLUDE_VOCAB_IN_TITLE = os.getenv("TITLE_VOCAB", "0") == "1"
+    # ※ INCLUDE_VOCAB_IN_TITLE / SERIES_LABELS はグローバル定義を使用
 
-    SERIES_LABELS = {
-        "en": "Real Practice Series",
-        "ja": "Real Practice シリーズ",
-        "ko": "Real Practice 시리즈",
-        "zh": "Real Practice 系列",
-        "es": "Serie Real Practice",
-        "pt": "Série Real Practice",
-        "fr": "Série Real Practice",
-        "id": "Seri Real Practice",
-    }
-
-def make_title(theme, title_lang: str, audio_lang_for_label: str | None = None,
-               pos: list[str] | None = None, difficulty: str | None = None,
-               pattern_hint: str | None = None):
-    """
-    方針：
-      - 形式は「<翻訳済みTopic>[ 語彙/Vocabulary] | <シリーズ名> (A2)」に統一
-      - “見切れ対策の手動クリップ”は廃止（UI側で省略表示されても、コードでは切らない）
-      - 最終的な100文字制限だけ sanitize_title() に委ねる
-    """
-    level = (difficulty or "A2").upper()
-
-    # 言語別シリーズ名（あなたの定義をそのまま利用）
-    series_name = SERIES_LABELS.get(title_lang, "Real Practice Series")
-
-    # テーマ翻訳
-    try:
-        theme_local = theme if title_lang == "en" else translate(theme, title_lang)
-    except Exception:
-        theme_local = theme
-
-    # Vocabulary の挿入（ENV: TITLE_VOCAB=1）
-    if title_lang == "ja":
-        topic_part = f"{theme_local} 語彙" if INCLUDE_VOCAB_IN_TITLE else f"{theme_local}"
-    else:
-        topic_part = f"{theme_local} Vocabulary" if INCLUDE_VOCAB_IN_TITLE else f"{theme_local}"
-
-    # 最終タイトル（ここでは一切クリップしない）
-    title_raw = f"{topic_part} | {series_name} ({level})"
-
-    # 余計な整形＋100文字上限だけ静かに適用
-    return sanitize_title(title_raw)
-
-    def make_desc(theme, title_lang: str):
-        if title_lang not in LANG_NAME:
-            title_lang = "en"
-        try:
-            theme_local = theme if title_lang == "en" else translate(theme, title_lang)
-        except Exception:
-            theme_local = theme
-        msg = {
-            "ja": f"{theme_local} に必須の語彙を短時間でチェック。声に出して一緒に練習しよう！ #vocab #learning",
-            "en": f"Quick practice for {theme_local} vocabulary. Repeat after the audio! #vocab #learning",
-            "pt": f"Pratique rápido o vocabulário de {theme_local}. Repita em voz alta! #vocab #aprendizado",
-            "es": f"Práctica rápida de vocabulario de {theme_local}. ¡Repite en voz alta! #vocab #aprendizaje",
-            "ko": f"{theme_local} 어휘를 빠르게 연습하세요. 소리 내어 따라 말해요! #vocab #learning",
-            "id": f"Latihan cepat kosakata {theme_local}. Ucapkan keras-keras! #vocab #belajar",
-            "fr": f"Entraînement rapide du vocabulaire {theme_local}. Répétez à voix haute ! #vocab #apprentissage",
-            "zh": f"快速练习 {theme_local} 词汇。跟着音频大声练习！ #vocab #learning",
-        }
-        return msg.get(title_lang, msg["en"])
-
-    def make_tags(theme, audio_lang, subs, title_lang, difficulty=None, pos=None):
-        tags = [
-            theme, "vocabulary", "language learning", "speaking practice",
-            "listening practice", "subtitles"
-        ]
-        if difficulty:
-            tags.append(f"CEFR {difficulty}")
-        if pos:
-            for p in pos:
-                tags.append(p)
-        for code in subs:
-            if code in LANG_NAME:
-                tags.append(f"{LANG_NAME[code]} subtitles")
-        seen, out = set(), []
-        for t in tags:
-            if t not in seen:
-                seen.add(t)
-                out.append(t)
-        return out[:15]
-
+    # ===== Title/Desc/Tags =====
+    # pos_for_all / difficulty_for_all は run_one 内の値をそのまま使用
     pos_for_title = pos_for_all
     difficulty_for_title = difficulty_for_all
-    pattern_for_title = pattern_for_all
+    pattern_for_title = pattern_for_all  # 現状未使用だが引数として受けておく
 
     title = make_title(
         master_theme, title_lang, audio_lang_for_label=audio_lang,
@@ -1310,6 +1235,80 @@ def make_title(theme, title_lang: str, audio_lang_for_label: str | None = None,
         return False
 
     _try_upload_with_fallbacks()
+
+# ───────────────────────────────────────────────
+# タイトル関連（グローバル関数としてネスト解除）
+# ───────────────────────────────────────────────
+def make_title(theme, title_lang: str, audio_lang_for_label: str | None = None,
+               pos: list[str] | None = None, difficulty: str | None = None,
+               pattern_hint: str | None = None) -> str:
+    """
+    方針：
+      - 形式は「<翻訳済みTopic>[ 語彙/Vocabulary] | <シリーズ名> (A2)」に統一
+      - “見切れ対策の手動クリップ”は廃止（UI側で省略表示されても、コードでは切らない）
+      - 最終的な100文字制限だけ sanitize_title() に委ねる
+    """
+    level = (difficulty or "A2").upper()
+
+    # 言語別シリーズ名
+    series_name = SERIES_LABELS.get(title_lang, "Real Practice Series")
+
+    # テーマ翻訳
+    try:
+        theme_local = theme if title_lang == "en" else translate(theme, title_lang)
+    except Exception:
+        theme_local = theme
+
+    # Vocabulary の挿入（ENV: TITLE_VOCAB=1）
+    if title_lang == "ja":
+        topic_part = f"{theme_local} 語彙" if INCLUDE_VOCAB_IN_TITLE else f"{theme_local}"
+    else:
+        topic_part = f"{theme_local} Vocabulary" if INCLUDE_VOCAB_IN_TITLE else f"{theme_local}"
+
+    # 最終タイトル（ここでは一切クリップしない）
+    title_raw = f"{topic_part} | {series_name} ({level})"
+
+    # 余計な整形＋100文字上限だけ静かに適用
+    return sanitize_title(title_raw)
+
+def make_desc(theme, title_lang: str) -> str:
+    if title_lang not in LANG_NAME:
+        title_lang = "en"
+    try:
+        theme_local = theme if title_lang == "en" else translate(theme, title_lang)
+    except Exception:
+        theme_local = theme
+    msg = {
+        "ja": f"{theme_local} に必須の語彙を短時間でチェック。声に出して一緒に練習しよう！ #vocab #learning",
+        "en": f"Quick practice for {theme_local} vocabulary. Repeat after the audio! #vocab #learning",
+        "pt": f"Pratique rápido o vocabulário de {theme_local}. Repita em voz alta! #vocab #aprendizado",
+        "es": f"Práctica rápida de vocabulario de {theme_local}. ¡Repite en voz alta! #vocab #aprendizaje",
+        "ko": f"{theme_local} 어휘를 빠르게 연습하세요. 소리 내어 따라 말해요! #vocab #learning",
+        "id": f"Latihan cepat kosakata {theme_local}. Ucapkan keras-keras! #vocab #belajar",
+        "fr": f"Entraînement rapide du vocabulaire {theme_local}. Répétez à voix haute ! #vocab #apprentissage",
+        "zh": f"快速练习 {theme_local} 词汇。跟着音频大声练习！ #vocab #learning",
+    }
+    return msg.get(title_lang, msg["en"])
+
+def make_tags(theme, audio_lang, subs, title_lang, difficulty=None, pos=None):
+    tags = [
+        theme, "vocabulary", "language learning", "speaking practice",
+        "listening practice", "subtitles"
+    ]
+    if difficulty:
+        tags.append(f"CEFR {difficulty}")
+    if pos:
+        for p in pos:
+            tags.append(p)
+    for code in subs:
+        if code in LANG_NAME:
+            tags.append(f"{LANG_NAME[code]} subtitles")
+    seen, out = set(), []
+    for t in tags:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out[:15]
 
 # ───────────────────────────────────────────────
 def run_all(topic, turns, privacy, do_upload, chunk_size):

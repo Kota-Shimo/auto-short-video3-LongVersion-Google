@@ -35,8 +35,8 @@ def pick_font(text: str) -> str:
 
 # 横動画レイアウト
 SCREEN_W, SCREEN_H = 1920, 1080
-DEFAULT_FSIZE_TOP  = 75
-DEFAULT_FSIZE_BOT  = 70
+DEFAULT_FSIZE_TOP  = 88
+DEFAULT_FSIZE_BOT  = 82
 TEXT_W             = 1500
 POS_Y              = 880
 LINE_GAP           = 26

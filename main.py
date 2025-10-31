@@ -1,12 +1,12 @@
 #!/usr/bin/env python
 """
-main.py – VOCAB専用ロング動画（横向き最適化／日本語TTS前処理／ラウンド毎に会話を挿入）
-- 1ラウンド = 6単語（単語→単語→例文） + その6語をすべて含む会話
+main.py – VOCAB専用ロング動画（横向き16:9 / ラウンド制 / 日本語TTS最適化）
+- 1ラウンド = 6単語（単語→単語→例文×6） + その6語をすべて含む会話
 - これを VOCAB_ROUNDS 回くり返す（既定=3）。各ラウンドの単語は重複なし。
 - 例文は常に「1文だけ」。失敗時は最大5回まで再生成、最後はフェールセーフ。
 - 翻訳（字幕）は1行化、複文は先頭1文のみ採用。URL/絵文字/余分な空白を除去。
 - 単語の翻訳は「例文＋テーマ＋品詞ヒント」で1語に確定（文脈訳）。
-- 生成後に横向き 1920x1080（既定）へ自動スケール＆パディング（ffmpeg）。
+- 生成音声は横向きに最適化された本物の 1920x1080 キャンバス上でレンダ（黒帯なし）。
 """
 
 import argparse, logging, re, json, subprocess, os, sys
@@ -51,10 +51,9 @@ VOCAB_WORDS   = int(os.getenv("VOCAB_WORDS", "6"))      # 1ラウンドの単語
 VOCAB_ROUNDS  = int(os.getenv("VOCAB_ROUNDS", "3"))     # ラウンド数（≈3）
 CONVO_LINES   = int(os.getenv("CONVO_LINES", "8"))      # まとめ会話の行数/ラウンド（偶数推奨）
 
-# 映像（横向き最適化）
-VIDEO_SIZE         = os.getenv("VIDEO_SIZE", "1920x1080")  # 例: "1920x1080"
-VIDEO_FPS          = int(os.getenv("FPS", "30"))
-FORCE_LANDSCAPE_MP4= os.getenv("FORCE_LANDSCAPE", "1") == "1"
+# 横向き 16:9 レンダ設定（chunk_builder に渡す）
+RENDER_SIZE   = os.getenv("RENDER_SIZE", "1920x1080")
+RENDER_BG_FIT = os.getenv("RENDER_BG_FIT", "cover")      # cover / contain（chunk_builder 対応前提）
 
 LANG_NAME = {
     "en": "English", "pt": "Portuguese", "id": "Indonesian",
@@ -133,6 +132,57 @@ def _clean_sub_line(text: str, lang_code: str) -> str:
     return t
 
 # ───────────────────────────────────────────────
+# 非英語での英字混入を弱める軽いフィルタ
+# ───────────────────────────────────────────────
+_LATIN_WORD_RE = re.compile(r"\b[A-Za-z]{3,}\b")
+
+def _clean_non_english_ascii(text: str, lang_code: str) -> str:
+    """英語以外の音声で紛れ込んだ英字語（3+文字）を間引く。短い略語は残す。"""
+    if lang_code == "en":
+        return text
+    t = text
+    # 英字を点で区切って読み飛ばされにくくする（checkin→c·h·e... は避けたいので3字以上は削除）
+    t = _LATIN_WORD_RE.sub("", t)
+    t = re.sub(r"\s{2,}", " ", t).strip()
+    return t or text
+
+# ───────────────────────────────────────────────
+# 日本語TTS最適化
+# ───────────────────────────────────────────────
+_KANJI_ONLY = re.compile(r"^[一-龥々]+$")
+_PARENS_JA  = re.compile(r"\s*[\(\（][^)\）]{1,40}[\)\）]\s*")
+
+def _to_kanji_digits(num_str: str) -> str:
+    # 連続数字を漢数字列に（簡易：位取りはせず各桁を二〇二五のように）
+    table = str.maketrans("0123456789", "〇一二三四五六七八九")
+    return num_str.translate(table)
+
+def normalize_ja_for_tts(text: str) -> str:
+    t = text or ""
+
+    # 1) 括弧内注釈を除去
+    t = re.sub(r"[\(（][^)\）]{1,40}[\)）]", "", t)
+
+    # 2) 記号類 → 読点
+    t = t.replace("/", "、").replace("-", "、").replace(":", "、").replace("・ ・", "・")
+
+    # 3) 数字 → 漢数字（各桁）
+    t = re.sub(r"\d{1,}", lambda m: _to_kanji_digits(m.group(0)), t)
+
+    # 4) 英字の連続を軽く分割（a〜z が長く続く場合は・で区切る → さらに短縮）
+    t = re.sub(r"([A-Za-z]{2,})", lambda m: "・".join(list(m.group(1).lower())), t)
+
+    # 5) 連続句読点と空白整理
+    t = re.sub(r"[。]{2,}", "。", t)
+    t = re.sub(r"[、]{2,}", "、", t)
+    t = re.sub(r"\s{2,}", " ", t).strip()
+
+    # 6) 文末の終止を保証
+    if t and t[-1] not in "。！？!?":
+        t += "。"
+    return t
+
+# ───────────────────────────────────────────────
 # 翻訳強化
 # ───────────────────────────────────────────────
 _ASCII_ONLY = re.compile(r'^[\x00-\x7F]+$')
@@ -160,6 +210,10 @@ def translate_sentence_strict(sentence: str, src_lang: str, target_lang: str) ->
         first = ""
     if not _needs_retranslate(first, src_lang, target_lang, sentence):
         return _clean_sub_line(first, target_lang)
+    try:
+        rsp = GPT.chat_completions.create  # 旧クライアント回避
+    except AttributeError:
+        pass
     try:
         rsp = GPT.chat.completions.create(
             model="gpt-4o-mini",
@@ -203,7 +257,7 @@ def _lang_rules(lang_code: str) -> str:
     )
 
 # ───────────────────────────────────────────────
-# 日本語向けヒューリスティック（fallback）
+# 日本語 fallback
 # ───────────────────────────────────────────────
 def _guess_ja_pos(word: str) -> str:
     w = (word or "").strip()
@@ -230,36 +284,6 @@ def _ja_template_fallback(word: str) -> str:
     if kind == "naadj":
         return f"{word}だね。"
     return f"{word}が必要です。"
-
-# ───────────────────────────────────────────────
-# 日本語TTS前処理（新規）※ main.py内で完結
-# ───────────────────────────────────────────────
-_KANJI_ONLY = re.compile(r"^[一-龥々]+$")
-_PARENS_JA  = re.compile(r"\s*[\(\（][^)\）]{1,40}[\)\）]\s*")
-
-_KANSUJI_MAP = {"0":"〇","1":"一","2":"二","3":"三","4":"四","5":"五","6":"六","7":"七","8":"八","9":"九"}
-def _to_kansuji_digits(s: str) -> str:
-    return "".join(_KANSUJI_MAP.get(ch, ch) for ch in s)
-
-def normalize_ja_for_tts(text: str) -> str:
-    t = (text or "").strip()
-    # 括弧内注釈を除去
-    t = re.sub(r"[（(][^）)]{1,40}[）)]", "", t)
-    # 英字連続は・で軽く区切る（例：ICカード -> I・Cカード / checkin -> c・h・e… は避けるため英単語を「・」1つに集約）
-    t = re.sub(r"[A-Za-z]{2,}", "・", t)
-    # 記号 → 読点
-    t = re.sub(r"[/:|\\\-]+", "、", t)
-    # 数字 → 漢数字（単純置換）
-    t = re.sub(r"\d+", lambda m: _to_kansuji_digits(m.group(0)), t)
-    # 連続句読点の縮約
-    t = re.sub(r"[。\.]{2,}", "。", t)
-    t = re.sub(r"[、、]{2,}", "、", t)
-    # 空白整理
-    t = re.sub(r"\s+", " ", t).strip()
-    # 終止符補完
-    if t and t[-1] not in "。！？!?":
-        t += "。"
-    return t
 
 # ───────────────────────────────────────────────
 # 語彙ユーティリティ
@@ -423,11 +447,36 @@ def _gen_vocab_list_from_spec(spec: dict, lang_code: str) -> list[str]:
     if len(words) >= n:
         return words[:n]
     fallback = ["check-in", "reservation", "checkout", "receipt", "elevator", "lobby", "upgrade"]
+    # 足りない分を補充
     for fw in fallback:
         if len(words) >= n: break
         if fw not in words:
             words.append(fw)
     return words[:n]
+
+# ───────────────────────────────────────────────
+# 日本語TTS用ふりがな（単語が漢字のみの時）
+# ───────────────────────────────────────────────
+def _kana_reading(word: str) -> str:
+    try:
+        rsp = GPT.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{
+                "role":"user",
+                "content":(
+                    "次の日本語単語の読みをひらがなだけで1語返してください。"
+                    "記号・括弧・説明は不要。\n"
+                    f"単語: {word}"
+                )
+            }],
+            temperature=0.0,
+            top_p=1.0,
+        )
+        yomi = (rsp.choices[0].message.content or "").strip()
+        yomi = re.sub(r"[^ぁ-ゖゝゞー]+", "", yomi)
+        return yomi[:20]
+    except Exception:
+        return ""
 
 # ───────────────────────────────────────────────
 # 単語の文脈つき1語訳（字幕用）
@@ -524,8 +573,8 @@ def _gen_conversation_using_words(words: list[str], lang_code: str, lines_per_ro
         if ":" in ln:
             spk, txt = ln.split(":", 1)
             txt = txt.strip()
-            if lang_code == "ja" and txt:
-                if txt[-1] not in "。！？!?":
+            if lang_code == "ja":
+                if txt and txt[-1] not in "。！？!?":
                     txt += "。"
             else:
                 txt = _ensure_period_for_sentence(txt, lang_code)
@@ -589,7 +638,7 @@ def _concat_with_gaps(audio_paths, gap_ms=120, pre_ms=120, min_ms=1000):
     return durs
 
 # ───────────────────────────────────────────────
-# 1コンボ処理（全ラウンド統合：各ラウンドの直後に会話を挿入）
+# 1コンボ処理（全ラウンド統合）
 # ───────────────────────────────────────────────
 def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_upload, chunk_size, context_hint="", spec=None):
     reset_temp()
@@ -627,11 +676,11 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
     plain_lines, tts_lines = [], []
 
     intro_line = _build_intro_line(master_theme, audio_lang, difficulty_for_all)
-    intro_tts = _ensure_period_for_sentence(intro_line, audio_lang) if audio_lang != "ja" else intro_line
+    intro_tts  = _ensure_period_for_sentence(intro_line, audio_lang) if audio_lang != "ja" else intro_line
     if audio_lang == "ja":
         intro_tts = normalize_ja_for_tts(intro_tts)
     out_audio = TEMP / f"00_intro.wav"
-    speak(audio_lang, "N", intro_tts, out_audio, style=("serious" if audio_lang == "ja" else "neutral"))
+    speak(audio_lang, "N", intro_tts, out_audio, style=("calm" if audio_lang == "ja" else "neutral"))
     audio_parts.append(out_audio)
     plain_lines.append(intro_line)
     tts_lines.append(intro_tts)
@@ -644,21 +693,24 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
             except Exception:
                 sub_rows[r].append(_clean_sub_line(intro_line, lang))
 
-    # ラウンドごとの処理（単語群→例文→会話→次の単語群）
+    # ラウンドごとの処理
     seen_words: set[str] = set()
     round_count = VOCAB_ROUNDS
 
     for round_idx in range(1, round_count + 1):
         # 1) このラウンドの6単語を決定（重複なし）
         if is_word_list:
+            # 手入力リストから未使用をピック
             pool = []
             for w in vocab_seed_list:
                 key = w.lower() if audio_lang not in ("ja","ko","zh") else w
                 if key not in seen_words:
                     pool.append(w)
             if len(pool) < VOCAB_WORDS:
+                # 足りなければ自動補完
                 pool.extend(_pick_unique_words(master_theme, audio_lang, VOCAB_WORDS - len(pool), base_spec, seen_words=set()))
             words_round = pool[:VOCAB_WORDS]
+            # seen 登録
             for w in words_round:
                 key = w.lower() if audio_lang not in ("ja","ko","zh") else w
                 seen_words.add(key)
@@ -666,13 +718,16 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
             words_round = _pick_unique_words(master_theme, audio_lang, VOCAB_WORDS, base_spec, seen_words)
 
         # 2) 単語→単語→例文（×6語）
+        round_examples: list[str] = []
         for w in words_round:
             ex = _gen_example_sentence(w, audio_lang, master_context)
+            round_examples.append(ex)
 
             # 単語1（2回）
             for _rep in (0, 1):
                 line = w
                 tts_line = line
+                # 日本語：漢字のみ語なら読みをTTS化、終止
                 if audio_lang == "ja":
                     if _KANJI_ONLY.fullmatch(line):
                         yomi = _kana_reading(line)
@@ -681,9 +736,13 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
                     base = re.sub(r"[。！？!?]+$", "", tts_line).strip()
                     tts_line = base + ("。" if len(base) >= 2 else "")
                     tts_line = normalize_ja_for_tts(tts_line)
+                else:
+                    tts_line = _ensure_period_for_sentence(tts_line, audio_lang)
+                    tts_line = _clean_non_english_ascii(tts_line, audio_lang)
+
                 out_audio = TEMP / f"{len(audio_parts)+1:02d}.wav"
-                style_for_tts = "neutral"  # 単語は短め
-                speak(audio_lang, "N", tts_line, out_audio, style=("calm" if audio_lang=="ja" and style_for_tts=="calm" else style_for_tts))
+                style_for_tts = "neutral" if audio_lang != "ja" else "neutral"
+                speak(audio_lang, "N", tts_line, out_audio, style=style_for_tts)
                 audio_parts.append(out_audio)
                 plain_lines.append(line)
                 tts_lines.append(tts_line)
@@ -694,6 +753,7 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
                         sub_rows[r].append(_clean_sub_line(line, lang))
                     else:
                         try:
+                            # 単語は文脈つき1語訳
                             pos_hint = None
                             if isinstance(base_spec, dict) and base_spec.get("pos"):
                                 pos_hint = ",".join(base_spec["pos"])
@@ -715,10 +775,13 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
                 tts_line = _PARENS_JA.sub(" ", line).strip()
                 tts_line = _ensure_period_for_sentence(tts_line, audio_lang)
                 tts_line = normalize_ja_for_tts(tts_line)
+                style_for_tts = "calm"
             else:
                 tts_line = _ensure_period_for_sentence(line, audio_lang)
+                tts_line = _clean_non_english_ascii(tts_line, audio_lang)
+                style_for_tts = "calm"
+
             out_audio = TEMP / f"{len(audio_parts)+1:02d}.wav"
-            style_for_tts = "calm" if audio_lang == "ja" else "neutral"  # 例文はやや落ち着き
             speak(audio_lang, "N", tts_line, out_audio, style=style_for_tts)
             audio_parts.append(out_audio)
             plain_lines.append(line)
@@ -733,7 +796,7 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
                         trans = line
                     sub_rows[r].append(_clean_sub_line(trans, lang))
 
-        # 3) まとめ会話（このラウンドの6語を全部使う）→ ラウンドごとに挿入してから次の単語群へ
+        # 3) まとめ会話（このラウンドの6語を全部使う）→ ラウンドごとに挿入
         convo = _gen_conversation_using_words(words_round, audio_lang, lines_per_round=CONVO_LINES)
         for spk, line in convo:
             if audio_lang == "ja":
@@ -742,8 +805,9 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
                 tts_line = normalize_ja_for_tts(tts_line)
             else:
                 tts_line = _ensure_period_for_sentence(line, audio_lang)
+                tts_line = _clean_non_english_ascii(tts_line, audio_lang)
             out_audio = TEMP / f"{len(audio_parts)+1:02d}.wav"
-            speak(audio_lang, spk, tts_line, out_audio, style=("neutral" if audio_lang=="ja" else "neutral"))
+            speak(audio_lang, spk, tts_line, out_audio, style=("calm" if audio_lang == "ja" else "neutral"))
             audio_parts.append(out_audio)
             plain_lines.append(line)
             tts_lines.append(tts_line)
@@ -777,7 +841,7 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
     # lines.json（冒頭タイトル＋全ラウンド）
     lines_data = []
     for i, dur in enumerate(new_durs):
-        row = ["N"]  # subtitle_video側のデフォでNラベルは非表示
+        row = ["N"]  # 字幕側では話者ラベル非表示前提（subtitle_videoの設定）
         for r in range(len(subs)):
             row.append(sub_rows[r][i])
         row.append(dur)
@@ -813,7 +877,7 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
     thumb_lang = subs[1] if len(subs) > 1 else audio_lang
     make_thumbnail(master_theme, thumb_lang, thumb)
 
-    # 動画生成（縦向き前提の既存パイプに合わせつつ、後段で横向き化）
+    # 動画生成（横向き16:9 / cover）
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     final_mp4 = OUTPUT / f"{audio_lang}-{'_'.join(subs)}_{stamp}.mp4"
     final_mp4.parent.mkdir(parents=True, exist_ok=True)
@@ -825,39 +889,16 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
         "--rows", str(len(subs)),
         "--out", str(final_mp4),
         "--center-n",
+        "--size", RENDER_SIZE,
+        "--bg-fit", RENDER_BG_FIT,  # chunk_builder が対応していることが前提
     ]
     logging.info("🔹 chunk_builder cmd: %s", " ".join(cmd))
     subprocess.run(cmd, check=True)
 
-    # 生成後に横向きへ正規化（1920x1080 既定／環境変数 VIDEO_SIZE で変更可）
-    if FORCE_LANDSCAPE_MP4:
-        try:
-            w, h = (int(VIDEO_SIZE.split("x")[0]), int(VIDEO_SIZE.split("x")[1]))
-            landscape_mp4 = OUTPUT / f"{final_mp4.stem}_landscape.mp4"
-            vf = f"scale=w={w}:h={h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,fps={VIDEO_FPS}"
-            ff = [
-                "ffmpeg", "-y",
-                "-i", str(final_mp4),
-                "-vf", vf,
-                "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-                "-c:a", "aac", "-b:a", "160k",
-                str(landscape_mp4)
-            ]
-            logging.info("🎬 ffmpeg landscape normalize: %s", " ".join(ff))
-            subprocess.run(ff, check=True)
-            # 置換
-            try:
-                final_mp4.unlink(missing_ok=True)
-            except Exception:
-                pass
-            final_mp4 = landscape_mp4
-        except Exception as e:
-            logging.warning(f"[VIDEO] landscape normalize skipped: {e}")
-
     if not do_upload:
         return
 
-    # メタ生成＆アップロード
+    # ───────────────────────────── メタ生成＆アップロード ─────────────────────────────
     def make_title(theme, title_lang: str, audio_lang_for_label: str | None = None,
                    pos: list[str] | None = None, difficulty: str | None = None,
                    pattern_hint: str | None = None):
@@ -931,6 +972,7 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
             "es": f"Práctica rápida de vocabulario de {theme_local}. ¡Repite en voz alta! #vocab #aprendizaje",
             "ko": f"{theme_local} 어휘를 빠르게 연습하세요. 소리 내어 따라 말해요! #vocab #learning",
             "id": f"Latihan cepat kosakata {theme_local}. Ucapkan keras-keras! #vocab #belajar",
+            "fr": f"Entraînement rapide du vocabulaire {theme_local}. Répétez à voix haute ! #vocab #apprentissage",
         }
         return msg.get(title_lang, msg["en"])
 
@@ -1090,7 +1132,6 @@ if __name__ == "__main__":
     ap.add_argument("--account", type=str, default="", help="この account のみ実行（combos.yaml の account 値に一致）")
     args = ap.parse_args()
 
-    # Account フィルタ
     target_cli = (args.account or "").strip()
     target_env = os.getenv("TARGET_ACCOUNT", "").strip()
     TARGET_ONLY = target_cli or target_env

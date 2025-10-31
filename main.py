@@ -1034,65 +1034,60 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
         return
 
     # ───────────────────────────── メタ生成＆アップロード ─────────────────────────────
+    # ====== Title policy (Long ver.) – Real Practice Series 統一 ======
+    # 環境変数で簡単トグル：
+    #   TITLE_VOCAB=1   → タイトルに「Vocabulary」を入れる（語彙ドリル回など）
+    #   SERIES_NAME     → 既定 "Real Practice Series" を上書き可能
+    INCLUDE_VOCAB_IN_TITLE = os.getenv("TITLE_VOCAB", "0") == "1"
+
+    SERIES_LABELS = {
+        "en": "Real Practice Series",
+        "ja": "Real Practice シリーズ",
+        "ko": "Real Practice 시리즈",
+        "zh": "Real Practice 系列",
+        "es": "Serie Real Practice",
+        "pt": "Série Real Practice",
+        "fr": "Série Real Practice",
+        "id": "Seri Real Practice",
+    }
+
     def make_title(theme, title_lang: str, audio_lang_for_label: str | None = None,
                    pos: list[str] | None = None, difficulty: str | None = None,
                    pattern_hint: str | None = None):
-        def _fallback_title():
-            try:
-                theme_local = theme if title_lang == "en" else translate(theme, title_lang)
-            except Exception:
-                theme_local = theme
-            cefr = (difficulty or "A2").upper()
-            pos_tag = f"[{pos[0]}] " if pos and isinstance(pos, list) and len(pos) == 1 else ""
-            if title_lang == "ja":
-                label = JP_CONV_LABEL.get(audio_lang_for_label or "", "")
-                base = f"{theme_local}で使える英語（{cefr}）"
-                t = f"{pos_tag}{base}"
-                if label and label not in t:
-                    t = f"{label} {t}"
-                return sanitize_title(t)[:40]
-            fallback_templates = {
-                "en": f"{pos_tag}{theme_local.capitalize()} vocab ({cefr})",
-                "pt": f"{pos_tag}Vocabulário de {theme_local} ({cefr})",
-                "es": f"{pos_tag}Vocabulario de {theme_local} ({cefr})",
-                "fr": f"{pos_tag}Vocabulaire : {theme_local} ({cefr})",
-                "id": f"{pos_tag}Kosakata {theme_local} ({cefr})",
-                "ko": f"{pos_tag}{theme_local} 필수 어휘 ({cefr})",
-                "zh": f"{pos_tag}{theme_local} 词汇 ({cefr})",
-            }
-            t = fallback_templates.get(title_lang, f"{pos_tag}{theme_local} ({cefr})")
-            return sanitize_title(t)[:70]
+        """
+        目的:
+          - すべての長尺動画タイトルを「<Topic> | Real Practice Series (A2)」に統一
+          - 語彙回のみ「Vocabulary」を挿入（ENV: TITLE_VOCAB=1）
+          - 言語別の自然さを担保（日本語では「語彙」表記、他は翻訳済テーマ利用）
+          - 多言語タイトル70文字以内制御
+        """
+        level = (difficulty or "A2").upper()
 
+        # 言語別シリーズ名
+        series_name = SERIES_LABELS.get(title_lang, "Real Practice Series")
+
+        # テーマ翻訳
         try:
-            client = OpenAI()
-            try:
-                theme_local = theme if title_lang == "en" else translate(theme, title_lang)
-            except Exception:
-                theme_local = theme
-            cefr = (difficulty or "A2").upper()
-            prompt = (
-                "You are a YouTube title creator for language-learning videos. "
-                f"Write ONE concise title in {LANG_NAME.get(title_lang,'English')} (<=70 chars). "
-                "Avoid emojis/quotes. Keep it natural.\n\n"
-                f"Topic: {theme_local}\nDifficulty: {cefr}\nReturn ONLY the title."
-            )
-            rsp = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,
-                top_p=0.9,
-            )
-            out = (rsp.choices[0].message.content or "").strip()
-            title = sanitize_title(out)
-            if not title or len(title) < 4:
-                return _fallback_title()
-            if title_lang == "ja":
-                label = JP_CONV_LABEL.get(audio_lang_for_label or "", "")
-                if label and label not in title:
-                    title = f"{label} {title}"
-            return title[:(40 if title_lang == "ja" else 70)]
+            theme_local = theme if title_lang == "en" else translate(theme, title_lang)
         except Exception:
-            return _fallback_title()
+            theme_local = theme
+
+        # Vocabulary挿入ポリシー
+        if title_lang == "ja":
+            topic_part = f"{theme_local} 語彙" if INCLUDE_VOCAB_IN_TITLE else f"{theme_local}"
+            title_raw = f"{topic_part} | {series_name} ({level})"
+            limit = 40
+        else:
+            topic_part = f"{theme_local} Vocabulary" if INCLUDE_VOCAB_IN_TITLE else f"{theme_local}"
+            title_raw = f"{topic_part} | {series_name} ({level})"
+            limit = 70
+
+        # クリーニング & 長さ制御
+        title = sanitize_title(title_raw)
+        if len(title) > limit:
+            title = title[:limit - 1] + "…"
+
+        return title
 
     def make_desc(theme, title_lang: str):
         if title_lang not in LANG_NAME:

@@ -1,4 +1,4 @@
-# thumbnail.py – centered glass panel + two-line caption (scene / phrase) – minimal fixes (error-safe)
+# thumbnail.py – centered glass panel + two-line caption (scene / phrase)
 from pathlib import Path
 from io import BytesIO
 import textwrap, logging, requests
@@ -19,51 +19,59 @@ FONT_LATN  = FONT_DIR / "RobotoSerif_36pt-Bold.ttf"
 FONT_CJK   = FONT_DIR / "NotoSansJP-Bold.ttf"
 FONT_KO    = FONT_DIR / "malgunbd.ttf"
 
-def _safe_font_path():
-    # 何も無ければ None を返す
-    for p in (FONT_LATN, FONT_CJK, FONT_KO):
-        try:
-            if p.exists():
-                return p
-        except Exception:
-            pass
-    return None
+# フォント存在チェック（落とさず警告だけ）
+for fp in (FONT_LATN, FONT_CJK, FONT_KO):
+    try:
+        if not fp.exists():
+            logging.warning(f"[font] Missing: {fp}")
+    except Exception:
+        logging.exception("[font] exists check failed")
 
 def pick_font(text: str) -> str | None:
-    # 既存ロジックを踏襲しつつ、見つからない場合 None を返す（後で load_default）
-    has_latn = FONT_LATN.exists() if hasattr(FONT_LATN, "exists") else False
-    has_cjk  = FONT_CJK.exists()  if hasattr(FONT_CJK, "exists")  else False
-    has_ko   = FONT_KO.exists()   if hasattr(FONT_KO, "exists")   else False
+    """文字種に応じてフォントパスを返す。無ければ None（後段で fallback）。"""
+    try:
+        has_latn = FONT_LATN.exists()
+        has_cjk  = FONT_CJK.exists()
+        has_ko   = FONT_KO.exists()
+    except Exception:
+        has_latn = has_cjk = has_ko = False
 
     for ch in text or "":
         cp = ord(ch)
-        if 0xAC00 <= cp <= 0xD7A3 and has_ko:
+        if 0xAC00 <= cp <= 0xD7A3 and has_ko:             # Hangul
             return str(FONT_KO)
         if ((0x4E00 <= cp <= 0x9FFF) or (0x3040 <= cp <= 0x30FF)) and has_cjk:
-            return str(FONT_CJK)
+            return str(FONT_CJK)                           # CJK/Kana
     if has_latn:
         return str(FONT_LATN)
     if has_cjk:
         return str(FONT_CJK)
     if has_ko:
         return str(FONT_KO)
-    return None  # ← 無い場合は None
+    return None
 
 def _load_font(font_path: str | None, size: int) -> ImageFont.FreeTypeFont:
+    """指定フォントが無くても落ちない安全ロード"""
     try:
         if font_path:
             return ImageFont.truetype(font_path, size)
     except Exception:
-        pass
-    # 最終フォールバック（落ちないことを優先）
+        logging.exception("[font] truetype failed")
     return ImageFont.load_default()
 
 # ------------ Language name map (ISO639-1 -> English name) ----
 LANG_NAME = {
-    "en": "English", "pt": "Portuguese", "id": "Indonesian",
-    "ja": "Japanese", "ko": "Korean",    "es": "Spanish",
-    "fr": "French",   "de": "German",    "it": "Italian",
-    "zh": "Chinese",  "ar": "Arabic",
+    "en": "English",
+    "pt": "Portuguese",
+    "id": "Indonesian",
+    "ja": "Japanese",
+    "ko": "Korean",
+    "es": "Spanish",
+    "fr": "French",
+    "de": "German",
+    "it": "Italian",
+    "zh": "Chinese",
+    "ar": "Arabic",
 }
 
 # ------------ Caption sizes / wrapping ---------------
@@ -75,6 +83,7 @@ BADGE_BASE   = "Lesson"
 BADGE_SIZE   = 60
 BADGE_POS    = (40, 30)
 
+# OpenAI クライアント（キー未設定でも落ちない）
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 # ------------------------------------------------------ Unsplash BG
@@ -84,9 +93,8 @@ def _unsplash(topic: str) -> Image.Image:
 
     url = (
         "https://api.unsplash.com/photos/random"
-        f"?query={requests.utils.quote(topic or 'language learning')}"
-        f"&orientation=landscape&content_filter=high"
-        f"&client_id={UNSPLASH_ACCESS_KEY}"
+        f"?query={requests.utils.quote(topic)}"
+        f"&orientation=landscape&client_id={UNSPLASH_ACCESS_KEY}"
     )
     try:
         r = requests.get(url, timeout=15); r.raise_for_status()
@@ -105,7 +113,9 @@ def _unsplash(topic: str) -> Image.Image:
 
 # ------------------------------------------------------ GPT Caption (scene | phrase)
 def _caption(topic: str, lang_code: str) -> str:
+    # 言語名を決定（未登録コードは English にフォールバック）
     lang_name = LANG_NAME.get(lang_code, "English")
+
     prompt = (
         "You craft clicky YouTube video thumbnails.\n"
         f"Language: {lang_name} ONLY.\n"
@@ -140,7 +150,7 @@ def _caption(topic: str, lang_code: str) -> str:
         }
         txt = defaults.get(lang_code, "Hotel|Check-in made easy")
 
-    # フォーマット保険
+    # フォーマット崩れの保険：パイプが無ければ擬似分割し、常に2行にする
     parts = [p.strip() for p in txt.split("|") if p.strip()]
     if len(parts) == 0:
         parts = ["Everyday", "Speak now"]
@@ -149,7 +159,7 @@ def _caption(topic: str, lang_code: str) -> str:
         mid = max(1, min(len(seg) // 2, 16))
         parts = [seg[:mid].strip() or "Everyday", seg[mid:].strip() or "Speak now"]
 
-    return f"{(parts[0] or 'Everyday')[:22]}|{(parts[1] or 'Speak now')[:24]}"
+    return f"{(parts[0] or 'Everyday')[:22]}|{(parts[1] or 'Speak now')[:24]}"  # 最終ガード
 
 # ------------------------------------------------------ helpers
 def _txt_size(draw: ImageDraw.ImageDraw, txt: str, font: ImageFont.FreeTypeFont):
@@ -165,11 +175,11 @@ def _draw(img: Image.Image, cap: str, badge_txt: str) -> Image.Image:
     draw = ImageDraw.Draw(img)
 
     l1, l2  = (cap.split("|") + [""])[:2]
-    l1, l2  = (l1 or "").strip(), (l2 or "").strip()
+    l1, l2  = l1.strip(), l2.strip()
 
-    # フォントが無い場合でも落ちないように load_default フォールバック
-    f1 = _load_font(pick_font(l1), F_H1)
-    f2 = _load_font(pick_font(l2 or l1), F_H2)
+    # フォント読み込みを安全化（無くても落とさない）
+    f1 = _load_font(pick_font(l1),          F_H1)
+    f2 = _load_font(pick_font(l2 or l1),    F_H2)
 
     t1 = textwrap.fill(l1, WRAP_H1) if l1 else ""
     t2 = textwrap.fill(l2, WRAP_H2) if l2 else ""
@@ -179,7 +189,7 @@ def _draw(img: Image.Image, cap: str, badge_txt: str) -> Image.Image:
 
     stroke = 4
     tw = max(w1, w2) + stroke*2
-    th = (h1 if t1 else 0) + ((h2 + 12) if t2 else 0)
+    th = h1 + (h2 + 12 if t2 else 0)
 
     BASE_PAD_X, BASE_PAD_Y = 60, 40
     pad_x = min(BASE_PAD_X, max(20, (W - tw)//2))
@@ -214,7 +224,7 @@ def _draw(img: Image.Image, cap: str, badge_txt: str) -> Image.Image:
     if t1:
         gd.text((x_txt, y_txt), t1, font=f1, fill=(255,255,255,255))
     if t2:
-        gd.text((x_txt, y_txt+(h1+12 if t1 else 0)), t2, font=f2, fill=(255,255,255,255))
+        gd.text((x_txt, y_txt+h1+12), t2, font=f2, fill=(255,255,255,255))
     glow = glow.filter(ImageFilter.GaussianBlur(14))
     glow = ImageEnhance.Brightness(glow).enhance(1.2)
     img.alpha_composite(glow)
@@ -224,23 +234,23 @@ def _draw(img: Image.Image, cap: str, badge_txt: str) -> Image.Image:
         draw.text((x_txt, y_txt), t1, font=f1, fill=(255,255,255),
                   stroke_width=stroke, stroke_fill=(0,0,0))
     if t2:
-        draw.text((x_txt, y_txt+(h1+12 if t1 else 0)), t2, font=f2,
+        draw.text((x_txt, y_txt+h1+12), t2, font=f2,
                   fill=(255,255,255), stroke_width=stroke, stroke_fill=(0,0,0))
 
     # badge（フォント未配置でも落ちない）
-    bf_path = pick_font(badge_txt or BADGE_BASE)
-    bf  = _load_font(bf_path, BADGE_SIZE)
-    draw.text(BADGE_POS, badge_txt or BADGE_BASE, font=bf,
+    bf  = _load_font(pick_font(badge_txt), BADGE_SIZE)
+    draw.text(BADGE_POS, badge_txt, font=bf,
               fill=(255,255,255), stroke_width=3, stroke_fill=(0,0,0))
     return img
 
 # ------------------------------------------------------ public
 def make_thumbnail(topic: str, lang_code: str, out: Path):
     """
-    lang_code は main.py から渡される第二字幕言語（subs[1]）を想定。
+    lang_code は main.py から渡される第二字幕言語（subs[1）を想定。
+    ここでは言語名に変換して GPT に明示するため、LANG_NAME を用いる。
     """
     bg    = _unsplash(topic)
-    cap   = _caption(topic, lang_code)  # (scene|phrase)
+    cap   = _caption(topic, lang_code)  # ← 安定して指定言語になる
     try:
         badge = translate(BADGE_BASE, lang_code) or BADGE_BASE
     except Exception:

@@ -313,7 +313,7 @@ def _ja_template_fallback(word: str) -> str:
 def _example_temp_for(lang_code: str) -> float:
     return 0.20 if lang_code == "ja" else EX_TEMP_DEFAULT
 
-def _gen_example_sentence(word: str, lang_code: str, context_hint: str = "") -> str:
+def _gen_example_sentence(word: str, lang_code: str, context_hint: str = "", difficulty: str | None = None) -> str:
     lang_name = LANG_NAME.get(lang_code, "English")
     ctx = (context_hint or "").strip()
     rules = _lang_rules(lang_code)
@@ -324,36 +324,47 @@ def _gen_example_sentence(word: str, lang_code: str, context_hint: str = "") -> 
             "No lists, no quotes, no emojis, no URLs. Keep it monolingual."
         ),
     }
+
+    # 難易度指示を追加
+    level_line = f" CEFR {difficulty} level の難易度にしてください。" if difficulty else ""
+
     if lang_code == "ja":
         user = (
             f"{rules} "
             f"単語「{word}」を必ず含めて、日本語で自然な一文をちょうど1つだけ書いてください。"
             "日常の簡単な状況を想定し、助詞の使い方を自然にしてください。"
             "かっこ書きや翻訳注釈は不要です。英字は禁止。"
+            f"{level_line}"
         )
         if ctx:
             user += f" シーンの文脈: {ctx}"
+
     elif lang_code == "ko":
         user = (
             f"{rules} "
             f"다음 단어를 반드시 포함하여 한국어로 자연스러운 문장을 정확히 1개만 쓰세요: {word} "
             "대괄호나 번역 메모 금지. 영문자 사용 금지."
+            f"{level_line}"
         )
         if ctx:
             user += f" 장면 힌트: {ctx}"
+
     elif lang_code == "zh":
         user = (
             f"{rules} "
             f"必须包含该词，且只写一句自然的{LANG_NAME.get(lang_code)}句子：{word}。"
             "不要使用括号或翻译注释。不要使用拉丁字母。"
+            f"{level_line}"
         )
         if ctx:
             user += f" 场景提示：{ctx}"
+
     else:
         user = (
             f"{rules} "
             f"Write exactly ONE short, natural sentence in {lang_name} that uses the word: {word}. "
             "Return ONLY the sentence."
+            f"{level_line}"
         )
         if ctx:
             user += f" Scene hint: {ctx}"
@@ -362,7 +373,7 @@ def _gen_example_sentence(word: str, lang_code: str, context_hint: str = "") -> 
         try:
             rsp = GPT.chat.completions.create(
                 model="gpt-4o-mini",
-                messages=[system, {"role":"user","content":user}],
+                messages=[system, {"role": "user", "content": user}],
                 temperature=_example_temp_for(lang_code),
                 top_p=0.9,
             )
@@ -374,13 +385,13 @@ def _gen_example_sentence(word: str, lang_code: str, context_hint: str = "") -> 
             continue
         valid = bool(cand) and _is_single_sentence(cand) and _fits_length(cand, lang_code)
         try:
-            contains_word = (word.lower() in cand.lower()) if lang_code not in ("ja","ko","zh") else (word in cand)
+            contains_word = (word.lower() in cand.lower()) if lang_code not in ("ja", "ko", "zh") else (word in cand)
         except Exception:
             contains_word = True
         if valid and contains_word:
             return _ensure_period_for_sentence(cand, lang_code)
 
-    # フェールセーフ
+    # フェールセーフ（バックアップ例文）
     if lang_code == "ja":
         return _ja_template_fallback(word)
     elif lang_code == "ko":
@@ -397,7 +408,7 @@ def _gen_example_sentence(word: str, lang_code: str, context_hint: str = "") -> 
         return _ensure_period_for_sentence(f"Ayo berlatih {word}", lang_code)
     else:
         return _ensure_period_for_sentence(f"Let's practice {word}", lang_code)
-
+        
 def _gen_vocab_list(theme: str, lang_code: str, n: int) -> list[str]:
     theme_for_prompt = translate(theme, lang_code) if lang_code != "en" else theme
     prompt = (
@@ -827,8 +838,16 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
 
         # 2) 単語→単語→例文（×N語）
         round_examples: list[str] = []
+
+        # topic_picker.py で作られた spec の中に difficulty があるはず
+        difficulty_for_this = spec.get("difficulty") if isinstance(spec, dict) else None
+
         for w in words_round:
-            ex = _gen_example_sentence(w, audio_lang, master_context)
+            # 難易度を一緒に渡す（_gen_example_sentence 内で CEFRレベル調整）
+            if difficulty_for_this:
+                ex = _gen_example_sentence(w, audio_lang, master_context, difficulty=difficulty_for_this)
+            else:
+                ex = _gen_example_sentence(w, audio_lang, master_context)
             round_examples.append(ex)
 
             # 単語（2回）

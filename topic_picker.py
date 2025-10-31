@@ -234,7 +234,8 @@ SCENE_WEIGHTS_BY_LEVEL: Dict[str, Dict[str, int]] = {
 
 def _env_level() -> str:
     v = os.getenv("CEFR_LEVEL", "").strip().upper()
-    return v if v in ("A1", "A2", "B1", "B2") else "A2"
+    # ENV が有効ならそれ、無ければ A2/B1/B2 からランダム（= Shorts 風の自動）
+    return v if v in ("A1", "A2", "B1", "B2") else rng.choice(["A2", "B1", "B2"])
 
 def _choose_weighted(items: List[Tuple[str, int]]) -> str:
     pool, weights = zip(*[(k, max(0, w)) for k, w in items if w > 0])
@@ -309,10 +310,8 @@ def _random_pos_from_env_or_default():
     return []  # ここは空（＝未指定）にして、main.py 内のロジックに委ねる運用が安全
 
 def _random_difficulty():
-    env = os.getenv("CEFR_LEVEL", "").strip().upper()
-    if env in ("A1", "A2", "B1", "B2"):
-        return env
-    return rng.choice(["A2", "B1", "B2"])
+    # 常に _env_level() と同じロジックを使い、ズレを無くす
+    return _env_level()
 
 def _parse_csv_env(name: str):
     v = os.getenv(name, "").strip()

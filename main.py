@@ -198,7 +198,7 @@ def _lang_rules(lang_code: str) -> str:
     return (
             f"Write entirely in {lang_name}. "
             "Do not code-switch or include other writing systems. "
-            "Avoid ASCII symbols like '/', '-', '→', '()', '[]', '<>', and '|'. "
+            "Avoid ASCII symbols like '/', '-', '→', '()", '[]', '<>', and '|'. "
             "No translation glosses, brackets, or country/language mentions."
     )
 
@@ -611,7 +611,7 @@ def _concat_with_gaps(audio_paths, gap_ms=120, pre_ms=120, min_ms=1000):
 # ───────────────────────────────────────────────
 # 1コンボ処理
 # ───────────────────────────────────────────────
-def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_upload, chunk_size, context_hint="", spec=None):
+def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_upload, chunk_size, context_hint="", spec=None, lines_only=False):
     reset_temp()
 
     raw = (topic or "").replace("\r", "\n").strip()
@@ -803,7 +803,8 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
     except Exception as e:
         logging.warning(f"[DEBUG_SCRIPT] write failed: {e}")
 
-    if args.lines_only:
+    # ← 引数で受け取ったフラグを見る（args は使わない）
+    if lines_only:
         return
 
     # サムネ
@@ -817,7 +818,7 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
     final_mp4.parent.mkdir(parents=True, exist_ok=True)
 
     cmd = [
-        "python", str(BASE/"chunk_builder.py"),
+        sys.executable, str(BASE/"chunk_builder.py"),
         str(TEMP/"lines.json"), str(TEMP/"full.mp3"), str(bg_png),
         "--chunk", str(chunk_size),
         "--rows", str(len(subs)),
@@ -909,7 +910,7 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
     _try_upload_with_fallbacks()
 
 # ───────────────────────────────────────────────
-def run_all(topic, turns, privacy, do_upload, chunk_size):
+def run_all(topic, turns, privacy, do_upload, chunk_size, lines_only=False):
     """
     親プロセス: 各 account ごとに子プロセスを起動（ISOLATED_RUN=1 を付与）
     子プロセス(ISOLATED_RUN=1): そのまま run_one を実行（再帰起動しない）
@@ -947,7 +948,8 @@ def run_all(topic, turns, privacy, do_upload, chunk_size):
             run_one(
                 picked_topic, turns, audio_lang, subs, title_lang,
                 privacy, account, do_upload, chunk_size,
-                context_hint=context_hint, spec=spec_for_run
+                context_hint=context_hint, spec=spec_for_run,
+                lines_only=lines_only
             )
         return
 
@@ -964,6 +966,8 @@ def run_all(topic, turns, privacy, do_upload, chunk_size):
             "--chunk", str(chunk_size),
             "--account", account,
         ]
+        if lines_only:
+            cmd.append("--lines-only")
         if not do_upload:
             cmd.append("--no-upload")
 
@@ -1001,4 +1005,11 @@ if __name__ == "__main__":
         logging.info(f"[ACCOUNT FILTER] Running only for account='{TARGET_ONLY}' ({len(COMBOS)} combo(s)).")
 
     topic = resolve_topic(args.topic)
-    run_all(topic, args.turns, args.privacy, not args.no_upload, args.chunk)
+    run_all(
+        topic=topic,
+        turns=args.turns,
+        privacy=args.privacy,
+        do_upload=not args.no_upload,
+        chunk_size=args.chunk,
+        lines_only=args.lines_only
+    )

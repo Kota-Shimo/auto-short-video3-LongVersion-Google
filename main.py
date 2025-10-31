@@ -541,46 +541,57 @@ def _build_intro_line(theme: str, audio_lang: str, difficulty: str | None) -> st
 # 6語すべてを使う短い会話（Alice/Bob）
 # ───────────────────────────────────────────────
 def _gen_conversation_using_words(words: list[str], lang_code: str, lines_per_round: int = CONVO_LINES) -> list[tuple[str, str]]:
-    rules = _lang_rules(lang_code)
+    """
+    与えた語をすべて1回以上使う短い会話。
+    出力はラベル無しの N 行テキストを想定し、こちらで Alice/Bob を交互に付与する。
+    """
     lang_name = LANG_NAME.get(lang_code, "English")
     word_list = ", ".join(words)
+
     system = {
         "role": "system",
         "content": (
-            "You write a short, natural two-person dialogue that MUST use ALL given words at least once, "
-            "spread naturally across the lines. Keep it monolingual. No lists, no emojis, no stage directions."
+            "Write a short, natural two-person dialogue. "
+            "Use ALL given words at least once, distributed naturally. "
+            "Do NOT add speaker names or bullets. No emojis, no stage directions. "
+            "Return EXACTLY the requested number of lines, one sentence per line."
         ),
     }
     user = (
-        f"{rules} "
-        f"Write a {lines_per_round}-line conversation in {lang_name} between Alice and Bob. "
-        f"Use ALL the following words at least once, integrated naturally (no definition tone): {word_list} "
-        "Alternate strictly starting with Alice:. One short sentence per line. Return ONLY the dialogue lines."
+        f"Language: {lang_name}\n"
+        f"Number of lines: {lines_per_round}\n"
+        f"Words to use (all of them, at least once): {word_list}\n"
+        "Output: just the lines, no names, no numbering."
     )
+
     try:
         rsp = GPT.chat.completions.create(
             model="gpt-4o-mini",
             messages=[system, {"role": "user", "content": user}],
-            temperature=0.5,
-            top_p=0.9,
+            temperature=0.5, top_p=0.9,
         )
         raw = (rsp.choices[0].message.content or "").strip()
     except Exception:
         raw = ""
-    lines = [ln.strip() for ln in raw.splitlines() if ln.strip().startswith(("Alice:", "Bob:"))]
+
+    # 行に分解（空行除去）して所定数に丸める
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    if len(lines) < lines_per_round:
+        # 足りない分は最後の行を複製して埋める（最小フェイルセーフ）
+        lines += [lines[-1]] * (lines_per_round - len(lines)) if lines else [""] * lines_per_round
+    lines = lines[:lines_per_round]
+
+    # 句点を補う
+    fixed = []
+    for t in lines:
+        t = _clean_strict(t)
+        fixed.append(_ensure_period_for_sentence(t, lang_code))
+
+    # Alice/Bob を交互に付与
     out: list[tuple[str, str]] = []
-    for ln in lines[:lines_per_round]:
-        if ":" in ln:
-            spk, txt = ln.split(":", 1)
-            txt = txt.strip()
-            if lang_code == "ja":
-                if txt and txt[-1] not in "。！？!?":
-                    txt += "。"
-            else:
-                txt = _ensure_period_for_sentence(txt, lang_code)
-            out.append((spk.strip(), txt))
-    if len(out) % 2 == 1:
-        out = out[:-1]
+    for i, t in enumerate(fixed):
+        spk = "Alice" if i % 2 == 0 else "Bob"
+        out.append((spk, t))
     return out
 
 # ───────────────────────────────────────────────

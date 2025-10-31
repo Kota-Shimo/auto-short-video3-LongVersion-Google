@@ -74,6 +74,109 @@ def sanitize_title(raw: str) -> str:
     title = re.sub(r"[\s\u3000]+", " ", title).strip()
     return title[:97] + "…" if len(title) > 100 else title or "Auto Video"
 
+# ───────────────────────────────────────────────
+# メタ生成ユーティリティ（トップレベル）
+# ───────────────────────────────────────────────
+def make_title(theme, title_lang: str, audio_lang_for_label: str | None = None,
+               pos: list[str] | None = None, difficulty: str | None = None,
+               pattern_hint: str | None = None):
+    def _fallback_title():
+        try:
+            theme_local = theme if title_lang == "en" else translate(theme, title_lang)
+        except Exception:
+            theme_local = theme
+        cefr = (difficulty or "A2").upper()
+        pos_tag = f"[{pos[0]}] " if pos and isinstance(pos, list) and len(pos) == 1 else ""
+        if title_lang == "ja":
+            label = JP_CONV_LABEL.get(audio_lang_for_label or "", "")
+            base = f"{theme_local}で使える英語（{cefr}）"
+            t = f"{pos_tag}{base}"
+            if label and label not in t:
+                t = f"{label} {t}"
+            return sanitize_title(t)[:40]
+        fallback_templates = {
+            "en": f"{pos_tag}{theme_local.capitalize()} vocab ({cefr})",
+            "pt": f"{pos_tag}Vocabulário de {theme_local} ({cefr})",
+            "es": f"{pos_tag}Vocabulario de {theme_local} ({cefr})",
+            "fr": f"{pos_tag}Vocabulaire : {theme_local} ({cefr})",
+            "id": f"{pos_tag}Kosakata {theme_local} ({cefr})",
+            "ko": f"{pos_tag}{theme_local} 필수 어휘 ({cefr})",
+        }
+        t = fallback_templates.get(title_lang, f"{pos_tag}{theme_local} ({cefr})")
+        return sanitize_title(t)[:70]
+
+    # 簡易生成→ダメならフォールバック
+    try:
+        client = OpenAI()
+        try:
+            theme_local = theme if title_lang == "en" else translate(theme, title_lang)
+        except Exception:
+            theme_local = theme
+        cefr = (difficulty or "A2").upper()
+        prompt = (
+            "You are a YouTube title creator for language-learning Shorts. "
+            f"Write ONE concise title in {LANG_NAME.get(title_lang,'English')} (<=70 chars). "
+            "Avoid emojis/quotes. Keep it natural.\n\n"
+            f"Topic: {theme_local}\nDifficulty: {cefr}\nReturn ONLY the title."
+        )
+        rsp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            top_p=0.9,
+        )
+        out = (rsp.choices[0].message.content or "").strip()
+        title = sanitize_title(out)
+        if not title or len(title) < 4:
+            return _fallback_title()
+        if title_lang == "ja":
+            label = JP_CONV_LABEL.get(audio_lang_for_label or "", "")
+            if label and label not in title:
+                title = f"{label} {title}"
+        return title[:(40 if title_lang == "ja" else 70)]
+    except Exception:
+        return _fallback_title()
+
+
+def make_desc(theme, title_lang: str):
+    if title_lang not in LANG_NAME:
+        title_lang = "en"
+    try:
+        theme_local = theme if title_lang == "en" else translate(theme, title_lang)
+    except Exception:
+        theme_local = theme
+    msg = {
+        "ja": f"{theme_local} に必須の語彙を短時間でチェック。声に出して一緒に練習しよう！ #vocab #learning",
+        "en": f"Quick practice for {theme_local} vocabulary. Repeat after the audio! #vocab #learning",
+        "pt": f"Pratique rápido o vocabulário de {theme_local}. Repita em voz alta! #vocab #aprendizado",
+        "es": f"Práctica rápida de vocabulario de {theme_local}. ¡Repite en voz alta! #vocab #aprendizaje",
+        "ko": f"{theme_local} 어휘를 빠르게 연습하세요. 소리 내어 따라 말해요! #vocab #learning",
+        "id": f"Latihan cepat kosakata {theme_local}. Ucapkan keras-keras! #vocab #belajar",
+        "fr": f"Entraînement rapide du vocabulaire de {theme_local}. Répétez à voix haute ! #vocab #apprentissage",
+    }
+    return msg.get(title_lang, msg["en"])
+
+
+def make_tags(theme, audio_lang, subs, title_lang, difficulty=None, pos=None):
+    tags = [
+        theme, "vocabulary", "language learning", "speaking practice",
+        "listening practice", "subtitles"
+    ]
+    if difficulty:
+        tags.append(f"CEFR {difficulty}")
+    if pos:
+        for p in pos:
+            tags.append(p)
+    for code in subs:
+        if code in LANG_NAME:
+            tags.append(f"{LANG_NAME[code]} subtitles")
+    seen, out = set(), []
+    for t in tags:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out[:15]
+
 def _infer_title_lang(audio_lang: str, subs: list[str], combo: dict) -> str:
     if "title_lang" in combo and combo["title_lang"]:
         return combo["title_lang"]
@@ -820,103 +923,6 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
 
     if not do_upload:
         return
-
-    # メタ生成＆アップロード
-    def make_title(theme, title_lang: str, audio_lang_for_label: str | None = None,
-                   pos: list[str] | None = None, difficulty: str | None = None,
-                   pattern_hint: str | None = None):
-        def _fallback_title():
-            try:
-                theme_local = theme if title_lang == "en" else translate(theme, title_lang)
-            except Exception:
-                theme_local = theme
-            cefr = (difficulty or "A2").upper()
-            pos_tag = f"[{pos[0]}] " if pos and isinstance(pos, list) and len(pos) == 1 else ""
-            if title_lang == "ja":
-                label = JP_CONV_LABEL.get(audio_lang_for_label or "", "")
-                base = f"{theme_local}で使える英語（{cefr}）"
-                t = f"{pos_tag}{base}"
-                if label and label not in t:
-                    t = f"{label} {t}"
-                return sanitize_title(t)[:40]
-            fallback_templates = {
-                "en": f"{pos_tag}{theme_local.capitalize()} vocab ({cefr})",
-                "pt": f"{pos_tag}Vocabulário de {theme_local} ({cefr})",
-                "es": f"{pos_tag}Vocabulario de {theme_local} ({cefr})",
-                "fr": f"{pos_tag}Vocabulaire : {theme_local} ({cefr})",
-                "id": f"{pos_tag}Kosakata {theme_local} ({cefr})",
-                "ko": f"{pos_tag}{theme_local} 필수 어휘 ({cefr})",
-            }
-            t = fallback_templates.get(title_lang, f"{pos_tag}{theme_local} ({cefr})")
-            return sanitize_title(t)[:70]
-
-        try:
-            client = OpenAI()
-            try:
-                theme_local = theme if title_lang == "en" else translate(theme, title_lang)
-            except Exception:
-                theme_local = theme
-            cefr = (difficulty or "A2").upper()
-            prompt = (
-                "You are a YouTube title creator for language-learning Shorts. "
-                f"Write ONE concise title in {LANG_NAME.get(title_lang,'English')} (<=70 chars). "
-                "Avoid emojis/quotes. Keep it natural.\n\n"
-                f"Topic: {theme_local}\nDifficulty: {cefr}\nReturn ONLY the title."
-            )
-            rsp = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,
-                top_p=0.9,
-            )
-            out = (rsp.choices[0].message.content or "").strip()
-            title = sanitize_title(out)
-            if not title or len(title) < 4:
-                return _fallback_title()
-            if title_lang == "ja":
-                label = JP_CONV_LABEL.get(audio_lang_for_label or "", "")
-                if label and label not in title:
-                    title = f"{label} {title}"
-            return title[:(40 if title_lang == "ja" else 70)]
-        except Exception:
-            return _fallback_title()
-
-    def make_desc(theme, title_lang: str):
-        if title_lang not in LANG_NAME:
-            title_lang = "en"
-        try:
-            theme_local = theme if title_lang == "en" else translate(theme, title_lang)
-        except Exception:
-            theme_local = theme
-        msg = {
-            "ja": f"{theme_local} に必須の語彙を短時間でチェック。声に出して一緒に練習しよう！ #vocab #learning",
-            "en": f"Quick practice for {theme_local} vocabulary. Repeat after the audio! #vocab #learning",
-            "pt": f"Pratique rápido o vocabulário de {theme_local}. Repita em voz alta! #vocab #aprendizado",
-            "es": f"Práctica rápida de vocabulario de {theme_local}. ¡Repite en voz alta! #vocab #aprendizaje",
-            "ko": f"{theme_local} 어휘를 빠르게 연습하세요. 소리 내어 따라 말해요! #vocab #learning",
-            "id": f"Latihan cepat kosakata {theme_local}. Ucapkan keras-keras! #vocab #belajar",
-        }
-        return msg.get(title_lang, msg["en"])
-
-    def make_tags(theme, audio_lang, subs, title_lang, difficulty=None, pos=None):
-        tags = [
-            theme, "vocabulary", "language learning", "speaking practice",
-            "listening practice", "subtitles"
-        ]
-        if difficulty:
-            tags.append(f"CEFR {difficulty}")
-        if pos:
-            for p in pos:
-                tags.append(p)
-        for code in subs:
-            if code in LANG_NAME:
-                tags.append(f"{LANG_NAME[code]} subtitles")
-        seen, out = set(), []
-        for t in tags:
-            if t not in seen:
-                seen.add(t)
-                out.append(t)
-        return out[:15]
 
     pos_for_title = pos_for_all
     difficulty_for_title = difficulty_for_all

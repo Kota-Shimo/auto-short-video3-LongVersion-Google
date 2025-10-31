@@ -48,9 +48,9 @@ EX_TEMP_DEFAULT = float(os.getenv("EX_TEMP", "0.35"))   # 例文
 LIST_TEMP       = float(os.getenv("LIST_TEMP", "0.30")) # 語彙リスト
 
 # 語彙・ラウンド
-VOCAB_WORDS   = int(os.getenv("VOCAB_WORDS", "3"))      # 1ラウンドの単語数（試験を楽に）
+VOCAB_WORDS   = int(os.getenv("VOCAB_WORDS", "2"))      # 1ラウンドの単語数（試験を楽に）
 VOCAB_ROUNDS  = int(os.getenv("VOCAB_ROUNDS", "2"))     # ラウンド数
-CONVO_LINES   = int(os.getenv("CONVO_LINES", "8"))      # そのラウンド末の会話行数（偶数推奨）
+CONVO_LINES   = int(os.getenv("CONVO_LINES", "2"))      # そのラウンド末の会話行数（偶数推奨）
 
 # 横向き 16:9 レンダ設定（chunk_builder に渡す）
 RENDER_SIZE   = os.getenv("RENDER_SIZE", "1920x1080")

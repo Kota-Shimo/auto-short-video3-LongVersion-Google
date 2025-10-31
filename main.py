@@ -62,6 +62,92 @@ LANG_NAME = {
     "zh": "Chinese",
 }
 
+# ====== Common “too-safe” words to avoid (language-specific) ======
+BANNED_COMMON_BY_LANG = {
+    "ja": {"チェックイン", "チェックアウト", "予約", "領収書", "レシート", "ロビー", "エレベーター", "アップグレード", "客室", "部屋"},
+    "ko": {"체크인", "체크아웃", "예약", "영수증", "로비", "엘리베이터", "업그레이드", "객실"},
+    "zh": {"办理入住", "退房", "预订", "发票", "大堂", "电梯", "升级", "房间"},
+    "es": {"registro", "reserva", "salida", "recibo", "ascensor", "vestíbulo", "mejora"},
+    "pt": {"check-in", "reserva", "checkout", "recibo", "elevador", "saguão", "upgrade"},
+    "fr": {"enregistrement", "réservation", "départ", "reçu", "ascenseur", "hall", "surclassement"},
+    "id": {"check-in", "reservasi", "check-out", "struk", "lift", "lobi", "upgrade"},
+    "en": {"check-in", "reservation", "checkout", "receipt", "elevator", "lobby", "upgrade"},
+}
+
+def _banned_for(lang_code: str) -> set[str]:
+    return set(BANNED_COMMON_BY_LANG.get(lang_code, set()))
+
+def _extract_words(text: str, lang_code: str, n: int, banned: set[str]) -> list[str]:
+    """
+    厳密パーサ：行頭番号除去/句読点除去/スクリプト規則/重複除去/バンリスト除去。
+    Latin系は最初のトークンのみ採用（"credit card" → "credit"）※必要なら hyphen は許可。
+    """
+    if not text:
+        return []
+    lines = [ (ln or "").strip() for ln in text.splitlines() ]
+    out: list[str] = []
+    seen: set[str] = set()
+    for ln in lines:
+        if not ln:
+            continue
+        # 先頭番号・接頭句を除去
+        ln = re.sub(r"^\s*(?:[-•・]|\d+[\).:]?)\s*", "", ln)
+        # 末尾の句読点や装飾を除去
+        ln = re.sub(r"[，、。.!?！？…:;]+$", "", ln).strip()
+        if not ln:
+            continue
+
+        # 言語別スクリプト制約
+        if lang_code in ("ja", "ko", "zh"):
+            # 英字混入を弾く
+            if _ASCII_LETTERS.search(ln):
+                continue
+            w = ln.replace("　", " ").split()[0]  # 万一スペースがあれば先頭トークン
+        else:
+            # Latin系は1トークン化（hyphenは許容）
+            token = ln.split()[0]
+            # 記号で終端するものを軽く除去
+            token = re.sub(r"[^\w\-’']", "", token)
+            w = token
+
+        if not w:
+            continue
+
+        # 短すぎ/長すぎ/数字のみ を除外
+        if len(w) < 2 or len(w) > 24 or re.fullmatch(r"\d+", w):
+            continue
+
+        # バンリスト・重複
+        key = (w.lower() if lang_code not in ("ja", "ko", "zh") else w)
+        if w in banned or key in seen:
+            continue
+
+        out.append(w)
+        seen.add(key)
+        if len(out) >= n:
+            break
+    return out
+
+def _gen_more_words_excluding(theme_for_prompt: str, lang_code: str, need: int, exclude: list[str], diff_hint: str = "") -> str:
+    """
+    不足分のみ追加取得。すでに得た語(exclude)とバンリストを明示して生成。
+    """
+    lang_name = LANG_NAME.get(lang_code, "the target language")
+    banned = sorted(_banned_for(lang_code) | set(exclude))
+    banned_line = ", ".join(banned[:50])  # 長すぎ回避
+
+    lines = [
+        f"List {need} HIGH-FREQUENCY words for: {theme_for_prompt}.",
+        f"Language: {lang_name}. Return ONLY one word per line, no numbering.",
+        "No explanations. No examples. No punctuation.",
+        f"Do NOT include any of these words: {banned_line or '(none)'}."
+    ]
+    if diff_hint:
+        lines.append(f"Approximate CEFR level: {diff_hint}. Prefer common, practical words.")
+    if lang_code in ("ko","ja","zh"):
+        lines.append("Use ONLY the target script. Do not use Latin letters.")
+    return "\n".join(lines)
+
 JP_CONV_LABEL = {
     "en": "英会話", "ja": "日本語会話", "es": "スペイン語会話",
     "pt": "ポルトガル語会話", "ko": "韓国語会話", "id": "インドネシア語会話",
@@ -415,70 +501,88 @@ def _gen_example_sentence(word: str, lang_code: str, context_hint: str = "", dif
         return _ensure_period_for_sentence(f"Let's practice {word}", lang_code)
         
 def _gen_vocab_list(theme: str, lang_code: str, n: int) -> list[str]:
+    """
+    汎用：強プロンプト → 厳密パース → 不足分だけ再生成 → 最後にフォールバック。
+    """
+    # 1) 生成プロンプト（明確化：言語/スクリプト/CEFRはここでは未指定）
     theme_for_prompt = translate(theme, lang_code) if lang_code != "en" else theme
-    prompt = (
-        f"List {n} essential single or hyphenated words for {theme_for_prompt} context "
-        f"in {LANG_NAME.get(lang_code,'English')}. Return ONLY one word per line, no numbering."
-        f"\nAll words must be written in {LANG_NAME.get(lang_code,'the target')} language."
-        + (" Do not use Latin letters. Use the target script only." if lang_code in ("ko","ja","zh") else "")
+    lang_name = LANG_NAME.get(lang_code, "the target language")
+    banned = _banned_for(lang_code)
+
+    base_prompt = (
+        f"List {n} HIGH-FREQUENCY words for the topic: {theme_for_prompt}.\n"
+        f"Language: {lang_name}. Return ONLY one word per line, no numbering.\n"
+        "No explanations. No examples. No punctuation."
+        + ("\nUse ONLY the target script (no Latin letters)." if lang_code in ("ko","ja","zh") else "")
+        + ("\nAvoid over-generic hotel words such as check-in / reservation equivalents." )
     )
 
-    # --- GPTで単語リスト生成（最大3回リトライ）---
     content = ""
+    # 2) リトライ（最大3回、温度を微増、軽いバックオフ）
     for attempt in range(3):
         try:
             rsp = GPT.chat.completions.create(
                 model="gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=LIST_TEMP,
+                messages=[{"role": "user", "content": base_prompt}],
+                temperature=LIST_TEMP + 0.05 * attempt,
                 top_p=0.9,
             )
             content = (rsp.choices[0].message.content or "")
-            if content.strip():  # 結果が空でなければOK
-                break
         except Exception as e:
-            print(f"[WARN] vocab generation failed (try {attempt+1}/3): {e}")
             content = ""
+        if content and content.strip():
+            break
 
-    # --- 行を単語に整形 ---
-    words = []
-    for line in (content or "").splitlines():
-        w = (line or "").strip()
-        if not w:
-            continue
-        # 先頭番号や末尾句読点を除去
-        w = re.sub(r"^\d+[\).]?\s*", "", w)
-        w = re.sub(r"[，、。.!?！？…]+$", "", w)
-        # 1語化（英語系は1単語、CJKはそのまま）
-        if lang_code not in ("ja", "ko", "zh"):
-            w = w.split()[0]
-        # 韓/中/日: 英字混入は除外
-        if lang_code in ("ko", "ja", "zh") and re.search(r"[A-Za-z]", w):
-            continue
-        if w and w not in words:
-            words.append(w)
+    words = _extract_words(content, lang_code, n, banned=banned)
 
-    # --- 不足分をフォールバックで補充 ---
+    # 3) 不足分があれば「不足分だけ」再生成（除外リスト明示）
+    if len(words) < n:
+        need = n - len(words)
+        prompt2 = _gen_more_words_excluding(theme_for_prompt, lang_code, need, exclude=words, diff_hint="")
+        content2 = ""
+        for attempt in range(2):
+            try:
+                rsp2 = GPT.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[{"role": "user", "content": prompt2}],
+                    temperature=LIST_TEMP + 0.1 * attempt,
+                    top_p=0.9,
+                )
+                content2 = (rsp2.choices[0].message.content or "")
+            except Exception:
+                content2 = ""
+            if content2 and content2.strip():
+                break
+        more = _extract_words(content2, lang_code, need, banned=banned | set(words))
+        words.extend([w for w in more if w not in words])
+
+    # 4) まだ足りなければ最小フォールバック（既出/バン除外）
     if len(words) < n:
         FALLBACKS = {
-            "ja": ["チェックイン", "予約", "チェックアウト", "領収書", "エレベーター", "ロビー", "アップグレード", "清掃", "客室"],
-            "ko": ["체크인", "예약", "체크아웃", "영수증", "엘리베이터", "로비", "업그레이드", "청소", "객실"],
-            "zh": ["办理入住", "预订", "退房", "发票", "电梯", "大堂", "升级", "清扫", "房间"],
-            "es": ["registro", "reserva", "salida", "recibo", "ascensor", "vestíbulo", "mejora"],
-            "pt": ["check-in", "reserva", "checkout", "recibo", "elevador", "saguão", "upgrade"],
-            "fr": ["enregistrement", "réservation", "départ", "reçu", "ascenseur", "hall", "surclassement"],
-            "id": ["check-in", "reservasi", "check-out", "struk", "lift", "lobi", "upgrade"],
-            "en": ["check-in", "reservation", "checkout", "receipt", "elevator", "lobby", "upgrade"],
+            "ja": ["清掃", "鍵", "フロント", "支払い", "荷物", "朝食", "通路", "館内", "地図", "案内"],
+            "ko": ["청소", "열쇠", "프런트", "결제", "짐", "아침식사", "복도", "관내", "지도", "안내"],
+            "zh": ["清扫", "钥匙", "前台", "付款", "行李", "早餐", "走廊", "馆内", "地图", "指引"],
+            "es": ["llave", "pago", "equipaje", "desayuno", "pasillo", "mapa", "servicio"],
+            "pt": ["chave", "pagamento", "bagagem", "café da manhã", "corredor", "mapa", "serviço"],
+            "fr": ["clé", "paiement", "bagage", "petit-déjeuner", "couloir", "plan", "service"],
+            "id": ["kunci", "pembayaran", "bagasi", "sarapan", "lorong", "peta", "layanan"],
+            "en": ["key", "payment", "luggage", "breakfast", "hallway", "map", "service"],
         }
-        for fw in FALLBACKS.get(lang_code, FALLBACKS["en"]):
+        fb = FALLBACKS.get(lang_code, FALLBACKS["en"])
+        for fw in fb:
             if len(words) >= n:
                 break
-            if fw not in words:
+            key = fw.lower() if lang_code not in ("ja", "ko", "zh") else fw
+            if fw not in banned and fw not in words:
                 words.append(fw)
 
     return words[:n]
     
 def _gen_vocab_list_from_spec(spec: dict, lang_code: str) -> list[str]:
+    """
+    spec（theme/context/pos/relation_mode/difficulty/pattern_hint）を尊重して語彙抽出。
+    まず spec 準拠で強プロンプト、足りない分は exclude 指定で追加生成、最後にフォールバック。
+    """
     n   = int(spec.get("count", VOCAB_WORDS))
     th  = spec.get("theme") or "general vocabulary"
     pos = spec.get("pos") or []
@@ -487,60 +591,79 @@ def _gen_vocab_list_from_spec(spec: dict, lang_code: str) -> list[str]:
     patt = (spec.get("pattern_hint") or "").strip()
     morph = spec.get("morphology") or []
     theme_for_prompt = translate(th, lang_code) if lang_code != "en" else th
+    lang_name = LANG_NAME.get(lang_code, "the target language")
+    banned = _banned_for(lang_code)
 
-    lines = []
-    lines.append(f"You are selecting {n} HIGH-FREQUENCY words for the topic: {theme_for_prompt}.")
+    # 1) 強プロンプト
+    lines = [
+        f"You are selecting {n} HIGH-FREQUENCY words for the topic: {theme_for_prompt}.",
+        f"Language: {lang_name}. Return ONLY one word (or short hyphenated term) per line, no numbering.",
+        "No explanations. No examples. No punctuation.",
+    ]
     if pos:
         lines.append("Restrict part-of-speech to: " + ", ".join(pos) + ".")
     if rel == "synonym":
-        lines.append("Prefer synonyms or near-synonyms around the central topic.")
+        lines.append("Prefer near-synonyms around the central topic.")
     elif rel == "antonym":
-        lines.append("Include at least one meaningful antonym pair if possible.")
+        lines.append("Include at most one useful antonym if natural; otherwise skip.")
     elif rel == "collocation":
-        lines.append("Prefer common collocations used with the topic in everyday speech.")
+        lines.append("Prefer common collocations used in everyday speech.")
     elif rel == "pattern":
-        lines.append("Prefer short reusable patterns or set phrases.")
+        lines.append("Prefer short reusable set phrases (but output as single tokens if possible).")
     if patt:
         lines.append(f"Pattern focus hint: {patt}.")
     if morph:
         lines.append("If natural, include related morphological family: " + ", ".join(morph) + ".")
-    if diff in ("A1","A2","B1"):
-        lines.append(f"Target approximate CEFR level: {diff}. Keep words short and common for this level.")
-    lines.append("Return ONLY one word or short hyphenated term per line, no numbering, no punctuation.")
-    lines.append(f"All words must be written in {LANG_NAME.get(lang_code,'the target')} language.")
+    if diff in ("A1","A2","B1","B2"):
+        lines.append(f"Approximate CEFR level: {diff}. Prefer common, practical words at this level.")
+    lines.append("Avoid over-generic hotel words (check-in / reservation / receipt / lobby / elevator equivalents).")
     if lang_code in ("ko","ja","zh"):
-        lines.append("Do not use Latin letters (no English).")
+        lines.append("Use ONLY the target script. Do not use Latin letters.")
+
     prompt = "\n".join(lines)
 
     content = ""
-    try:
-        rsp = GPT.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role":"user","content":prompt}],
-            temperature=LIST_TEMP,
-            top_p=0.9,
-        )
-        content = (rsp.choices[0].message.content or "")
-    except Exception:
-        content = ""
+    for attempt in range(3):
+        try:
+            rsp = GPT.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role":"user","content":prompt}],
+                temperature=LIST_TEMP + 0.05 * attempt,
+                top_p=0.9,
+            )
+            content = (rsp.choices[0].message.content or "")
+        except Exception:
+            content = ""
+        if content and content.strip():
+            break
 
-    words = []
-    for line in content.splitlines():
-        w = (line or "").strip()
-        if not w:
-            continue
-        w = re.sub(r"^\d+[\).]?\s*", "", w)
-        w = re.sub(r"[，、。.!?！？]+$", "", w)
-        w = w.split()[0]
-        if not w:
-            continue
-        if lang_code in ("ko","ja","zh") and _ASCII_LETTERS.search(w):
-            continue
-        if w not in words:
-            words.append(w)
+    words = _extract_words(content, lang_code, n, banned=banned)
 
-    if len(words) >= n:
-        return words[:n]
+    # 2) 不足分：「不足分だけ」再生成（exclude=既得＋バン）
+    if len(words) < n:
+        need = n - len(words)
+        prompt2 = _gen_more_words_excluding(theme_for_prompt, lang_code, need, exclude=words, diff_hint=diff if diff in ("A1","A2","B1","B2") else "")
+        content2 = ""
+        for attempt in range(2):
+            try:
+                rsp2 = GPT.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[{"role":"user","content":prompt2}],
+                    temperature=LIST_TEMP + 0.1 * attempt,
+                    top_p=0.9,
+                )
+                content2 = (rsp2.choices[0].message.content or "")
+            except Exception:
+                content2 = ""
+            if content2 and content2.strip():
+                break
+        more = _extract_words(content2, lang_code, need, banned=banned | set(words))
+        words.extend([w for w in more if w not in words])
+
+    # 3) それでも足りなければ、最後に控えめフォールバック
+    if len(words) < n:
+        return _gen_vocab_list(th, lang_code, n)
+    return words[:n]
 
     # 言語別フォールバック
     return _gen_vocab_list(th, lang_code, n)

@@ -23,19 +23,54 @@ def wrap_cjk(text: str, width: int = 16) -> str:
         return "\n".join(textwrap.wrap(text, width, break_long_words=True))
     return text
 
-# ---------- フォント存在チェック ----------
-for f in (FONT_LATN, FONT_JP, FONT_KO):
-    if not os.path.isfile(f):
-        raise FileNotFoundError(f"Font not found: {f}")
+# ---------- フォント存在チェック（フェイルバック有り） ----------
+def _ensure_font(path: str, fallback: str) -> str:
+    if os.path.isfile(path):
+        return path
+    # fallback が存在すればそれを返す。無ければ path のまま返す（後段 pick_font でもう一段フォールバック）
+    if os.path.isfile(fallback):
+        print(f"[WARN] Font not found: {path} -> fallback to {fallback}")
+        return fallback
+    print(f"[WARN] Font not found and no fallback present: {path}")
+    return path
+
+# 少なくともどれか1つは存在していることを期待（JP優先）
+if not (os.path.isfile(FONT_JP) or os.path.isfile(FONT_LATN) or os.path.isfile(FONT_KO)):
+    raise FileNotFoundError(
+        "No font found. Please place at least one of these into ./fonts : "
+        "NotoSansJP-Bold.ttf / RobotoSerif_36pt-Bold.ttf / malgunbd.ttf"
+    )
+
+# ラテンと韓国語は、無ければ日本語フォントへフェイルバック
+FONT_LATN = _ensure_font(FONT_LATN, FONT_JP if os.path.isfile(FONT_JP) else FONT_LATN)
+FONT_KO   = _ensure_font(FONT_KO,   FONT_JP if os.path.isfile(FONT_JP) else FONT_LATN)
+# 日本語フォントが無い場合はラテンへ
+if not os.path.isfile(FONT_JP) and os.path.isfile(FONT_LATN):
+    print("[WARN] JP font not found -> fallback to LATN font for JP text.")
+    FONT_JP = FONT_LATN
 
 def pick_font(text: str) -> str:
+    """文字種から推奨フォントを返す（最終的に存在確認して返却）。"""
+    chosen = FONT_LATN
     for ch in text:
         name = ud.name(ch, "")
         if "HANGUL" in name:
-            return FONT_KO
+            chosen = FONT_KO
+            break
         if any(tag in name for tag in ("CJK", "HIRAGANA", "KATAKANA")):
-            return FONT_JP
-    return FONT_LATN
+            chosen = FONT_JP
+            break
+    # 最後に存在確認し、無ければ安全側で LATN → JP → KO の順で代替
+    if os.path.isfile(chosen):
+        return chosen
+    if os.path.isfile(FONT_LATN):
+        return FONT_LATN
+    if os.path.isfile(FONT_JP):
+        return FONT_JP
+    if os.path.isfile(FONT_KO):
+        return FONT_KO
+    # ここに来るのは稀。上の総合チェックで止まる想定
+    return chosen
 
 # ============ レイアウト定数（横動画用） ============
 SCREEN_W, SCREEN_H = 1920, 1080

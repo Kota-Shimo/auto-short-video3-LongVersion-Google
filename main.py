@@ -77,10 +77,15 @@ def reset_temp():
     TEMP.mkdir(exist_ok=True)
 
 def sanitize_title(raw: str) -> str:
-    title = re.sub(r"^\s*(?:\d+\s*[.)]|[-•・])\s*", "", raw)
-    title = re.sub(r"[\s\u3000]+", " ", title).strip()
-    return title[:97] + "…" if len(title) > 100 else title or "Auto Video"
-
+    """
+    タイトルは“切らない”方針：
+      - 余計な番号・全角空白などのノイズだけ除去
+      - YouTube上限(100文字)は静かにカット（省略記号は付けない）
+    """
+    title = re.sub(r"^\s*(?:\d+\s*[.)]|[-•・])\s*", "", raw)  # 先頭の番号や記号
+    title = re.sub(r"[\s\u3000]+", " ", title).strip()       # 連続スペース正規化
+    return title[:100]  # ← 省略記号を付けず、静かに100文字で切る
+    
 def _infer_title_lang(audio_lang: str, subs: list[str], combo: dict) -> str:
     if "title_lang" in combo and combo["title_lang"]:
         return combo["title_lang"]
@@ -1051,43 +1056,37 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
         "id": "Seri Real Practice",
     }
 
-    def make_title(theme, title_lang: str, audio_lang_for_label: str | None = None,
-                   pos: list[str] | None = None, difficulty: str | None = None,
-                   pattern_hint: str | None = None):
-        """
-        目的:
-          - すべての長尺動画タイトルを「<Topic> | Real Practice Series (A2)」に統一
-          - 語彙回のみ「Vocabulary」を挿入（ENV: TITLE_VOCAB=1）
-          - 言語別の自然さを担保（日本語では「語彙」表記、他は翻訳済テーマ利用）
-          - 多言語タイトル70文字以内制御
-        """
-        level = (difficulty or "A2").upper()
+def make_title(theme, title_lang: str, audio_lang_for_label: str | None = None,
+               pos: list[str] | None = None, difficulty: str | None = None,
+               pattern_hint: str | None = None):
+    """
+    方針：
+      - 形式は「<翻訳済みTopic>[ 語彙/Vocabulary] | <シリーズ名> (A2)」に統一
+      - “見切れ対策の手動クリップ”は廃止（UI側で省略表示されても、コードでは切らない）
+      - 最終的な100文字制限だけ sanitize_title() に委ねる
+    """
+    level = (difficulty or "A2").upper()
 
-        # 言語別シリーズ名
-        series_name = SERIES_LABELS.get(title_lang, "Real Practice Series")
+    # 言語別シリーズ名（あなたの定義をそのまま利用）
+    series_name = SERIES_LABELS.get(title_lang, "Real Practice Series")
 
-        # テーマ翻訳
-        try:
-            theme_local = theme if title_lang == "en" else translate(theme, title_lang)
-        except Exception:
-            theme_local = theme
+    # テーマ翻訳
+    try:
+        theme_local = theme if title_lang == "en" else translate(theme, title_lang)
+    except Exception:
+        theme_local = theme
 
-        # Vocabulary挿入ポリシー
-        if title_lang == "ja":
-            topic_part = f"{theme_local} 語彙" if INCLUDE_VOCAB_IN_TITLE else f"{theme_local}"
-            title_raw = f"{topic_part} | {series_name} ({level})"
-            limit = 40
-        else:
-            topic_part = f"{theme_local} Vocabulary" if INCLUDE_VOCAB_IN_TITLE else f"{theme_local}"
-            title_raw = f"{topic_part} | {series_name} ({level})"
-            limit = 70
+    # Vocabulary の挿入（ENV: TITLE_VOCAB=1）
+    if title_lang == "ja":
+        topic_part = f"{theme_local} 語彙" if INCLUDE_VOCAB_IN_TITLE else f"{theme_local}"
+    else:
+        topic_part = f"{theme_local} Vocabulary" if INCLUDE_VOCAB_IN_TITLE else f"{theme_local}"
 
-        # クリーニング & 長さ制御
-        title = sanitize_title(title_raw)
-        if len(title) > limit:
-            title = title[:limit - 1] + "…"
+    # 最終タイトル（ここでは一切クリップしない）
+    title_raw = f"{topic_part} | {series_name} ({level})"
 
-        return title
+    # 余計な整形＋100文字上限だけ静かに適用
+    return sanitize_title(title_raw)
 
     def make_desc(theme, title_lang: str):
         if title_lang not in LANG_NAME:

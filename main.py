@@ -53,7 +53,7 @@ VOCAB_WORDS   = int(os.getenv("VOCAB_WORDS", "6"))      # 1ラウンドの単語
 VOCAB_ROUNDS  = int(os.getenv("VOCAB_ROUNDS", "1"))     # ラウンド数
 CONVO_LINES   = int(os.getenv("CONVO_LINES", "15"))      # そのラウンド末の会話行数（偶数推奨）
 # ← 既存: VOCAB_WORDS / VOCAB_ROUNDS / CONVO_LINES の定義の下あたりに追加
-WORD_REPEAT = int(os.getenv("WORD_REPEAT", "2"))  # 既定=2回（従来互換）
+WORD_REPEAT = int(os.getenv("WORD_REPEAT", "1"))  # 既定=2回（従来互換）
 NO_CONVO    = os.getenv("NO_CONVO", "0") == "1"   # 1で会話ブロックをスキップ
 
 # 横向き 16:9 レンダ設定（chunk_builder に渡す）

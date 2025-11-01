@@ -206,14 +206,16 @@ def _purge_ascii_for_tts(text: str, lang_code: str) -> str:
 # 英語以外で紛れ込んだ英単語を弱める軽いフィルタ（既存互換）
 _LATIN_WORD_RE = re.compile(r"\b[A-Za-z]{3,}\b")
 def _clean_non_english_ascii(text: str, lang_code: str) -> str:
-    if lang_code == "en":
-        return text
+    """
+    🎯 修正版：
+    - 韓国語・日本語・中国語だけ英字除去
+    - スペイン語・フランス語・ポルトガル語などラテン文字言語はそのまま保持
+    """
+    # ko / ja / zh のみ英字除去
     if lang_code in ("ko", "ja", "zh"):
         return _purge_ascii_for_tts(text, lang_code)
-    t = text
-    t = _LATIN_WORD_RE.sub("", t)
-    t = re.sub(r"\s{2,}", " ", t).strip()
-    return t or text
+    # それ以外（es, pt, fr, idなど）は触らない
+    return text
 
 # ───────────────────────────────────────────────
 # 日本語TTS最適化

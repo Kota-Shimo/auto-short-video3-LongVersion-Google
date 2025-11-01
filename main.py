@@ -50,8 +50,11 @@ LIST_TEMP       = float(os.getenv("LIST_TEMP", "0.30")) # 語彙リスト
 
 # 語彙・ラウンド
 VOCAB_WORDS   = int(os.getenv("VOCAB_WORDS", "6"))      # 1ラウンドの単語数
-VOCAB_ROUNDS  = int(os.getenv("VOCAB_ROUNDS", "5"))     # ラウンド数
-CONVO_LINES   = int(os.getenv("CONVO_LINES", "8"))      # そのラウンド末の会話行数（偶数推奨）
+VOCAB_ROUNDS  = int(os.getenv("VOCAB_ROUNDS", "1"))     # ラウンド数
+CONVO_LINES   = int(os.getenv("CONVO_LINES", "15"))      # そのラウンド末の会話行数（偶数推奨）
+# ← 既存: VOCAB_WORDS / VOCAB_ROUNDS / CONVO_LINES の定義の下あたりに追加
+WORD_REPEAT = int(os.getenv("WORD_REPEAT", "2"))  # 既定=2回（従来互換）
+NO_CONVO    = os.getenv("NO_CONVO", "0") == "1"   # 1で会話ブロックをスキップ
 
 # 横向き 16:9 レンダ設定（chunk_builder に渡す）
 RENDER_SIZE   = os.getenv("RENDER_SIZE", "1920x1080")
@@ -1042,8 +1045,8 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
                 ex = _gen_example_sentence(w, audio_lang, master_context)
             round_examples.append(ex)
 
-            # 単語（2回）
-            for _rep in (0, 1):
+            # 単語
+            for _rep in range(WORD_REPEAT):
                 line = w
                 tts_line = line
                 if audio_lang == "ja":
@@ -1121,34 +1124,35 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
                     sub_rows[r].append(_clean_sub_line(trans, lang))
 
         # 3) まとめ会話（このラウンドの語を全部使う）
-        convo = _gen_conversation_using_words(words_round, audio_lang, lines_per_round=CONVO_LINES)
-        for spk, line in convo:
-            if audio_lang == "ja":
-                base = re.sub(r"[。！？!?]+$", "", line).strip()
-                tts_line = base + ("。" if base and base[-1] not in "。！？!?" else "")
-                tts_line = normalize_ja_for_tts(tts_line)
-            else:
-                tts_line = _ensure_period_for_sentence(line, audio_lang)
-            if audio_lang in ("ko","ja","zh"):
-                tts_line = _purge_ascii_for_tts(tts_line, audio_lang)
-            else:
-                tts_line = _clean_non_english_ascii(tts_line, audio_lang)
-
-            out_audio = TEMP / f"{len(audio_parts)+1:02d}.wav"
-            speak(audio_lang, spk, tts_line, out_audio, style=("calm" if audio_lang == "ja" else "neutral"))
-            audio_parts.append(out_audio)
-            plain_lines.append(line)
-            tts_lines.append(tts_line)
-            for r, lang in enumerate(subs):
-                if lang == audio_lang:
-                    sub_rows[r].append(_clean_sub_line(line, lang))
+        if not NO_CONVO:
+            convo = _gen_conversation_using_words(words_round, audio_lang, lines_per_round=CONVO_LINES)
+            for spk, line in convo:
+                if audio_lang == "ja":
+                    base = re.sub(r"[。！？!?]+$", "", line).strip()
+                    tts_line = base + ("。" if base and base[-1] not in "。！？!?" else "")
+                    tts_line = normalize_ja_for_tts(tts_line)
                 else:
-                    try:
-                        trans = translate_sentence_strict(line, src_lang=audio_lang, target_lang=lang)
-                    except Exception:
-                        trans = line
-                    sub_rows[r].append(_clean_sub_line(trans, lang))
+                    tts_line = _ensure_period_for_sentence(line, audio_lang)
+                if audio_lang in ("ko","ja","zh"):
+                    tts_line = _purge_ascii_for_tts(tts_line, audio_lang)
+                else:
+                    tts_line = _clean_non_english_ascii(tts_line, audio_lang)
 
+                out_audio = TEMP / f"{len(audio_parts)+1:02d}.wav"
+                speak(audio_lang, spk, tts_line, out_audio, style=("calm" if audio_lang == "ja" else "neutral"))
+                audio_parts.append(out_audio)
+                plain_lines.append(line)
+                tts_lines.append(tts_line)
+                for r, lang in enumerate(subs):
+                    if lang == audio_lang:
+                        sub_rows[r].append(_clean_sub_line(line, lang))
+                    else:
+                        try:
+                            trans = translate_sentence_strict(line, src_lang=audio_lang, target_lang=lang)
+                        except Exception:
+                            trans = line
+                        sub_rows[r].append(_clean_sub_line(trans, lang))
+                                        
     # ── 単純結合 → 整音 → mp3 ─────────────────────────────
     gap_ms = GAP_MS_JA if audio_lang == "ja" else GAP_MS
     pre_ms = PRE_SIL_MS_JA if audio_lang == "ja" else PRE_SIL_MS

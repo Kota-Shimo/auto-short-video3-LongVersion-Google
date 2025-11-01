@@ -19,7 +19,7 @@ on:
       target:
         description: "アップロード先アカウント（acc1〜acc9）。空なら全アカウント"
         required: false
-        default: "acc9"
+        default: ""
 
 concurrency:
   group: auto-vocab-${{ github.ref }}
@@ -81,7 +81,7 @@ jobs:
         env:
           OPENAI_API_KEY:      ${{ secrets.OPENAI_API_KEY }}
           UNSPLASH_ACCESS_KEY: ${{ secrets.UNSPLASH_ACCESS_KEY }}
-          VOCAB_WORDS:         30
+          VOCAB_WORDS:         50
           WORD_REPEAT:         1
           NO_CONVO:            "1"     # ← 会話なし
           # 手動で target を選んだらそのチャンネルのみ / 空なら main.py が全アカウント処理
@@ -99,10 +99,10 @@ jobs:
         env:
           OPENAI_API_KEY:      ${{ secrets.OPENAI_API_KEY }}
           UNSPLASH_ACCESS_KEY: ${{ secrets.UNSPLASH_ACCESS_KEY }}
-          VOCAB_WORDS:         20
+          VOCAB_WORDS:         40
           WORD_REPEAT:         1
           NO_CONVO:            "0"
-          CONVO_LINES:         8
+          CONVO_LINES:         10
           TARGET_ACCOUNT:      ${{ env.TARGET_ACCOUNT }}
         run: |
           python main.py AUTO --privacy public --chunk 999
@@ -118,7 +118,7 @@ jobs:
           OPENAI_API_KEY:      ${{ secrets.OPENAI_API_KEY }}
           UNSPLASH_ACCESS_KEY: ${{ secrets.UNSPLASH_ACCESS_KEY }}
           VOCAB_WORDS:         10
-          VOCAB_ROUNDS:        3
+          VOCAB_ROUNDS:        5
           WORD_REPEAT:         1
           NO_CONVO:            "0"
           CONVO_LINES:         6

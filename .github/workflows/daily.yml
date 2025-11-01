@@ -1,43 +1,26 @@
 name: Auto-Vocab-Daily
 
 on:
-  # ─────────────────────────────────────────────
-  # スケジュール実行（UTC表記）※JSTに直すと右コメントの時刻
-  # ① 単語＋例文のみ（会話なし）    → JST 09:00
-  - schedule:
-      - cron: '0 0 * * *'      # 09:00 JST
-  # ② 最後に会話1ブロックのみ        → JST 15:00
-  - schedule:
-      - cron: '0 6 * * *'      # 15:00 JST
-  # ③ 各ラウンドごとに会話あり       → JST 21:00
-  - schedule:
-      - cron: '0 12 * * *'     # 21:00 JST
-
-  # ─────────────────────────────────────────────
-  # 手動実行：どのタイプを動かすか選択可
+  schedule:
+    #- cron: '0 15 * * *'   # JST00:00
+    #- cron: '0 17 * * *'   # JST02:00
+    - cron: '0 19 * * *'   # JST04:00
+    #- cron: '0 21 * * *'   # JST06:00
+    #- cron: '0 3  * * *'   # JST12:00
+    #- cron: '0 6  * * *'   # JST15:00
+    - cron: '0 9  * * *'   # JST18:00
+    #- cron: '0 12 * * *'   # JST21:00
   workflow_dispatch:
-    inputs:
-      mode:
-        description: "実行モードを選択"
-        required: true
-        default: "final-convo"  # ← 手動のデフォルトは②（最後に会話1ブロック）
-        type: choice
-        options:
-          - no-convo       # ① 単語＋例文のみ（会話なし）
-          - final-convo    # ② 単語＋例文＋最後に会話1ブロック
-          - every-convo    # ③ 単語＋例文＋各ラウンドごとに会話
 
 concurrency:
   group: auto-vocab-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  # 共通セットアップをまとめたジョブ（以降のジョブが継承して使う）
-  _setup:
-    name: Prepare environment (shared)
+  build:
     runs-on: ubuntu-latest
-    outputs:
-      dummy: ok
+    timeout-minutes: 540
+
     steps:
       - name: ⬇️ Checkout repo
         uses: actions/checkout@v4
@@ -48,7 +31,7 @@ jobs:
           python-version: '3.12'
           cache: 'pip'
 
-      - name: 📦 Install requirements (FFmpeg含む)
+      - name: 📦 Install requirements
         run: |
           set -euxo pipefail
           sudo apt-get update -y
@@ -56,7 +39,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
-      - name: 🔑 Restore YouTube tokens (acc1–acc9; 無ければスキップ)
+      - name: 🔑 Restore YouTube tokens (acc1–acc9, guard if missing)
         env:
           YT_ACC1: ${{ secrets.YT_TOKEN_ACC1 }}
           YT_ACC2: ${{ secrets.YT_TOKEN_ACC2 }}
@@ -70,6 +53,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p tokens
+
           restore_token() {
             local NAME="$1" ; local VAL="$2"
             if [ -n "${VAL:-}" ]; then
@@ -79,6 +63,7 @@ jobs:
               echo "Skip $NAME (secret not set)"
             fi
           }
+
           restore_token acc1 "$YT_ACC1"
           restore_token acc2 "$YT_ACC2"
           restore_token acc3 "$YT_ACC3"
@@ -89,97 +74,21 @@ jobs:
           restore_token acc8 "$YT_ACC8"
           restore_token acc9 "$YT_ACC9"
 
-  # ① 単語＋例文のみ（会話なし） — NO_CONVO=1, FINAL_CONVO=0
-  vocab_no_convo:
-    name: ① Vocab Only（単語＋例文のみ／会話なし）
-    runs-on: ubuntu-latest
-    needs: _setup
-    # スケジュール 0 0 * * * に反応 or 手動で mode=no-convo を選んだ時だけ実行
-    if: >
-      (github.event_name == 'schedule' && github.event.schedule == '0 0 * * *')
-      || (github.event_name == 'workflow_dispatch' && inputs.mode == 'no-convo')
-    steps:
-      - uses: actions/checkout@v4
-      - name: 🎬 Generate & Upload
+      - name: 🎬 Build & Upload All Combos (vocab専用)
         env:
           OPENAI_API_KEY:      ${{ secrets.OPENAI_API_KEY }}
           UNSPLASH_ACCESS_KEY: ${{ secrets.UNSPLASH_ACCESS_KEY }}
-          # ─ 動画の中身を決めるフラグ ─
-          NO_CONVO:     "1"    # 会話を完全に出さない
-          FINAL_CONVO:  "0"    # 最後の会話ブロックも無し
-          CONVO_LINES:  "0"    # 使われないが明示的に0
-          VOCAB_WORDS:  "12"   # 1ラウンドの単語数
-          VOCAB_ROUNDS: "3"    # ラウンド数
-          WORD_REPEAT:  "1"    # 単語読み上げの繰り返し回数
-          CONTENT_MODE: "vocab"
-          TARGET_ACCOUNT: "acc9"  # ← 出力アカウント
-          DEBUG_SCRIPT: "1"
+          VOCAB_WORDS:         50
+          DEBUG_SCRIPT:        "1"
+          TARGET_ACCOUNT:      "acc9"      # ←★ この1行を追加
         run: |
-          python main.py "AUTO" --privacy public --chunk 999
+          python main.py AUTO \
+            --privacy public \
+            --chunk 999
 
-  # ② 単語＋例文＋最後に会話1ブロック — NO_CONVO=0, FINAL_CONVO=1
-  vocab_final_convo:
-    name: ② Vocab + Final Convo（最後に会話1ブロック）
-    runs-on: ubuntu-latest
-    needs: _setup
-    if: >
-      (github.event_name == 'schedule' && github.event.schedule == '0 6 * * *')
-      || (github.event_name == 'workflow_dispatch' && inputs.mode == 'final-convo')
-    steps:
-      - uses: actions/checkout@v4
-      - name: 🎬 Generate & Upload
-        env:
-          OPENAI_API_KEY:      ${{ secrets.OPENAI_API_KEY }}
-          UNSPLASH_ACCESS_KEY: ${{ secrets.UNSPLASH_ACCESS_KEY }}
-          # ─ 動画の中身を決めるフラグ ─
-          NO_CONVO:     "0"    # 会話を出す
-          FINAL_CONVO:  "1"    # 最後に1回だけ会話ブロック
-          CONVO_LINES:  "12"   # 会話の行数（偶数推奨）
-          VOCAB_WORDS:  "10"
-          VOCAB_ROUNDS: "2"
-          WORD_REPEAT:  "1"
-          CONTENT_MODE: "vocab"
-          TARGET_ACCOUNT: "acc9"
-          DEBUG_SCRIPT: "1"
-        run: |
-          python main.py "AUTO" --privacy public --chunk 999
-
-  # ③ 単語＋例文＋各ラウンドごとに会話 — NO_CONVO=0, FINAL_CONVO=0
-  vocab_every_convo:
-    name: ③ Vocab + Every Convo（各ラウンド末に会話）
-    runs-on: ubuntu-latest
-    needs: _setup
-    if: >
-      (github.event_name == 'schedule' && github.event.schedule == '0 12 * * *')
-      || (github.event_name == 'workflow_dispatch' && inputs.mode == 'every-convo')
-    steps:
-      - uses: actions/checkout@v4
-      - name: 🎬 Generate & Upload
-        env:
-          OPENAI_API_KEY:      ${{ secrets.OPENAI_API_KEY }}
-          UNSPLASH_ACCESS_KEY: ${{ secrets.UNSPLASH_ACCESS_KEY }}
-          # ─ 動画の中身を決めるフラグ ─
-          NO_CONVO:     "0"    # 会話を出す
-          FINAL_CONVO:  "0"    # ラウンドごとに会話
-          CONVO_LINES:  "10"
-          VOCAB_WORDS:  "8"
-          VOCAB_ROUNDS: "3"
-          WORD_REPEAT:  "1"
-          CONTENT_MODE: "vocab"
-          TARGET_ACCOUNT: "acc9"
-          DEBUG_SCRIPT: "1"
-        run: |
-          python main.py "AUTO" --privacy public --chunk 999
-
-  # 失敗時でもデバッグ回収
-  upload_debug:
-    name: ⤴️ Upload debug artifacts
-    if: always()
-    runs-on: ubuntu-latest
-    needs: [vocab_no_convo, vocab_final_convo, vocab_every_convo]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/upload-artifact@v4
+      - name: ⤴️ Upload debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
           name: debug-temp
           path: |

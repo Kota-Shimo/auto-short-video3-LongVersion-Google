@@ -73,6 +73,7 @@ jobs:
           VOCAB_WORDS:         30
           WORD_REPEAT:         1
           NO_CONVO:            "1"     # ← 会話なし
+　　　　　　　TARGET_ACCOUNT:      "acc9"   # ← ★ここでチャンネル指定！
         run: |
           python main.py AUTO --privacy public --chunk 999
 

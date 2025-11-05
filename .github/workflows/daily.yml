@@ -81,8 +81,8 @@ jobs:
         env:
           OPENAI_API_KEY:      ${{ secrets.OPENAI_API_KEY }}
           UNSPLASH_ACCESS_KEY: ${{ secrets.UNSPLASH_ACCESS_KEY }}
-          VOCAB_WORDS:         150
-          WORD_REPEAT:         1
+          VOCAB_WORDS:         50
+          WORD_REPEAT:         3
           NO_CONVO:            "1"     # ← 会話なし
           # 手動で target を選んだらそのチャンネルのみ / 空なら main.py が全アカウント処理
           TARGET_ACCOUNT:      ${{ env.TARGET_ACCOUNT }}

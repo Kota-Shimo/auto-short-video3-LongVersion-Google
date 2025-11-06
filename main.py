@@ -318,7 +318,7 @@ def _lang_rules(lang_code: str) -> str:
         return (
             "Write entirely in Korean (Hangul only). "
             "Do not include Latin letters or other languages. "
-            "Avoid ASCII symbols such as '/', '-', '→', '()", '[]', '<>', and '|'. "
+            "Avoid ASCII symbols such as '/', '-', '→', '()', '[]', '<>', and '|'. "
             "No translation glosses or stage directions."
         )
     if lang_code == "zh":

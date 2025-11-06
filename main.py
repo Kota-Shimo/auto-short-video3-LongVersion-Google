@@ -22,7 +22,13 @@ from openai import OpenAI
 
 from config         import BASE, OUTPUT, TEMP
 from translate      import translate
-from tts_openai     import speak
+# --- TTS 切替（Google / OpenAI）---
+USE_GOOGLE_TTS = os.getenv("USE_GOOGLE_TTS", "0") == "1"
+if USE_GOOGLE_TTS:
+    from tts_google import speak
+else:
+    from tts_openai import speak
+
 from audio_fx       import enhance
 from bg_image       import fetch as fetch_bg
 from thumbnail      import make_thumbnail

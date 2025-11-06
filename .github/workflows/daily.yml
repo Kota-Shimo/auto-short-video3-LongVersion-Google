@@ -32,6 +32,8 @@ jobs:
     env:
       # 手動実行時: ここに inputs.target が入る / スケジュール時: 空（→ 全アカウント）
       TARGET_ACCOUNT: ${{ github.event.inputs.target }}
+      # ← ここで Google TTS を有効化（OpenAIへ戻すときは "0"）
+      USE_GOOGLE_TTS: "1"
 
     steps:
       - name: ⬇️ Checkout repo
@@ -71,6 +73,15 @@ jobs:
             fi
           done
 
+      # ===== Google Cloud TTS 鍵を復元（Secrets: GCP_TTS_KEY_B64） =====
+      - name: 🔐 Restore GCP TTS key
+        run: echo "$GCP_TTS_KEY_B64" | base64 -d > gcp_tts_key.json
+        env:
+          GCP_TTS_KEY_B64: ${{ secrets.GCP_TTS_KEY_B64 }}
+
+      - name: 🌍 Set GOOGLE_APPLICATION_CREDENTIALS
+        run: echo "GOOGLE_APPLICATION_CREDENTIALS=$PWD/gcp_tts_key.json" >> $GITHUB_ENV
+
       # ──────────────── パターン① 単語＋例文のみ ────────────────
       # スケジュール: 0 19 * * *（JST04:00）
       # 手動: inputs.mode == no-convo
@@ -84,7 +95,6 @@ jobs:
           VOCAB_WORDS:         150
           WORD_REPEAT:         2
           NO_CONVO:            "1"     # ← 会話なし
-          # 手動で target を選んだらそのチャンネルのみ / 空なら main.py が全アカウント処理
           TARGET_ACCOUNT:      ${{ env.TARGET_ACCOUNT }}
         run: |
           python main.py AUTO --privacy public --chunk 120

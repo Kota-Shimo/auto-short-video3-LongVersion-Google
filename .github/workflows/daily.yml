@@ -28,7 +28,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 540
+    timeout-minutes: 800
     env:
       # 手動実行時: ここに inputs.target が入る / スケジュール時: 空（→ 全アカウント）
       TARGET_ACCOUNT: ${{ github.event.inputs.target }}

@@ -92,7 +92,7 @@ jobs:
         env:
           OPENAI_API_KEY:      ${{ secrets.OPENAI_API_KEY }}
           UNSPLASH_ACCESS_KEY: ${{ secrets.UNSPLASH_ACCESS_KEY }}
-          VOCAB_WORDS:         150
+          VOCAB_WORDS:         6
           WORD_REPEAT:         2
           NO_CONVO:            "1"     # ← 会話なし
           TARGET_ACCOUNT:      ${{ env.TARGET_ACCOUNT }}

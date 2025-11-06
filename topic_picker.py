@@ -319,9 +319,56 @@ def _parse_csv_env(name: str):
         return []
     return [x.strip() for x in v.split(",") if x.strip()]
 
+# ─────────────────────────────────────────
+# 言語別の難易度ラベル（試験名）を付与
+# ─────────────────────────────────────────
+def _difficulty_metadata(audio_lang: str, cefr: str) -> Dict[str, str]:
+    cefr = (cefr or "").upper()
+    base = f"CEFR {cefr}"
+    exam = ""
+    exam_level = ""
+    extra = ""
+
+    if audio_lang == "ja":
+        exam = "JLPT"
+        mapping = {"A1": "N5", "A2": "N4", "B1": "N3", "B2": "N2"}
+        exam_level = mapping.get(cefr, "")
+        extra = f"{exam} {exam_level}" if exam_level else ""
+    elif audio_lang == "ko":
+        exam = "TOPIK"
+        mapping = {"A1": "1", "A2": "2", "B1": "3", "B2": "4"}
+        exam_level = mapping.get(cefr, "")
+        extra = f"{exam} {exam_level}" if exam_level else ""
+    elif audio_lang == "zh":
+        exam = "HSK"
+        mapping = {"A1": "1", "A2": "2", "B1": "3", "B2": "4"}
+        exam_level = mapping.get(cefr, "")
+        extra = f"{exam} {exam_level}" if exam_level else ""
+    elif audio_lang == "es":
+        exam = "DELE"
+        exam_level = cefr
+        extra = f"{exam} {exam_level}"
+    elif audio_lang == "fr":
+        exam = "DELF"
+        exam_level = cefr
+        extra = f"{exam} {exam_level}"
+    else:
+        # en / pt / id などは CEFR 表示のみ（安全）
+        extra = ""
+
+    label = base + (f" / {extra}" if extra else "")
+    return {
+        "label": label,
+        "exam": exam,
+        "exam_level": exam_level,
+    }
+
 def _build_spec(functional: str, scene: str, audio_lang: str) -> dict:
     # テーマは機能＋シーンを併記（タイトル側で自然に短縮される）
     theme = f"{functional} – {scene}"
+
+    cefr = _random_difficulty()
+    meta = _difficulty_metadata(audio_lang, cefr)
 
     spec = {
         "theme": theme,
@@ -329,7 +376,10 @@ def _build_spec(functional: str, scene: str, audio_lang: str) -> dict:
         "count": int(os.getenv("VOCAB_WORDS", "6")),
         "pos": _random_pos_from_env_or_default(),            # POSはENV優先（未指定なら main.py 側で言語別推定が安全）
         "relation_mode": os.getenv("RELATION_MODE", "").strip().lower(),  # 未指定なら空
-        "difficulty": _random_difficulty(),                  # ENVが無ければ A2/B1/B2 からランダム
+        "difficulty": cefr,                                   # CEFR A1/A2/B1/B2
+        "difficulty_label": meta["label"],                    # 例: "CEFR A2 / JLPT N4"
+        "exam": meta["exam"],                                 # 例: "JLPT"
+        "exam_level": meta["exam_level"],                     # 例: "N4"
         "pattern_hint": _pick_pattern(functional, scene),
         "morphology": _parse_csv_env("MORPHOLOGY"),
     }
@@ -359,6 +409,9 @@ def pick_by_content_type(content_type: str, audio_lang: str, return_context: boo
                 "pos": [],
                 "relation_mode": "",
                 "difficulty": _random_difficulty(),
+                "difficulty_label": f"CEFR {_random_difficulty()}",
+                "exam": "",
+                "exam_level": "",
                 "pattern_hint": "",
                 "morphology": [],
             }

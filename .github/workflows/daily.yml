@@ -87,7 +87,7 @@ jobs:
           # 手動で target を選んだらそのチャンネルのみ / 空なら main.py が全アカウント処理
           TARGET_ACCOUNT:      ${{ env.TARGET_ACCOUNT }}
         run: |
-          python main.py AUTO --privacy public --chunk 999
+          python main.py AUTO --privacy public --chunk 120
 
       # ──────────────── パターン② 最後に会話 ────────────────
       # スケジュール: 0 9 * * *（JST18:00）
@@ -105,7 +105,7 @@ jobs:
           CONVO_LINES:         10
           TARGET_ACCOUNT:      ${{ env.TARGET_ACCOUNT }}
         run: |
-          python main.py AUTO --privacy public --chunk 999
+          python main.py AUTO --privacy public --chunk 120
 
       # ──────────────── パターン③ 各ラウンドごとに会話 ────────────────
       # スケジュール: 0 15 * * *（JST00:00）
@@ -124,4 +124,4 @@ jobs:
           CONVO_LINES:         6
           TARGET_ACCOUNT:      ${{ env.TARGET_ACCOUNT }}
         run: |
-          python main.py AUTO --privacy public --chunk 999
+          python main.py AUTO --privacy public --chunk 120

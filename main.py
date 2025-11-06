@@ -75,7 +75,7 @@ LANG_NAME = {
 # ====== “出がちの安全すぎる語”を抑制（テーマ無関連化を避ける） ======
 BANNED_COMMON_BY_LANG = {
     "ja": {"チェックイン", "チェックアウト", "予約", "領収書", "レシート", "ロビー", "エレベーター", "アップグレード", "客室", "部屋"},
-    "ko": {"체크인", "체크아웃", "예약", "영수증", "로비", "엘리베이터", "업그레이드", "객실"},
+    "ko": {"체크인", "체크아웃", "예약", "영수증", "로비", "엘리베이터", "업그레이드", "객室"},
     "zh": {"办理入住", "退房", "预订", "发票", "大堂", "电梯", "升级", "房间"},
     "es": {"registro", "reserva", "salida", "recibo", "ascensor", "vestíbulo", "mejora"},
     "pt": {"check-in", "reserva", "checkout", "recibo", "elevador", "saguão", "upgrade"},
@@ -172,12 +172,14 @@ def _clean_strict(text: str) -> str:
     return _normalize_spaces(t)
 
 def _is_single_sentence(text: str) -> bool:
-    return len(_SENT_END.findall(text or "")) <= 1
+    # 最大2文まで許容（句点が3つ以上はNG）
+    return len(_SENT_END.findall(text or "")) <= 2
 
 def _fits_length(text: str, lang_code: str) -> bool:
+    # 緩和：CJKは40字まで、ラテン系は16語まで
     if lang_code in ("ja", "ko", "zh"):
-        return len(text or "") <= 30
-    return len(re.findall(r"\b\w+\b", text or "")) <= 12
+        return len(text or "") <= 40
+    return len(re.findall(r"\b\w+\b", text or "")) <= 16
 
 def _ensure_period_for_sentence(txt: str, lang_code: str) -> str:
     t = txt or ""
@@ -411,7 +413,8 @@ def _contains_word_relaxed(word: str, cand: str, lang_code: str) -> bool:
     # Latin 系：単純部分一致（大小無視）
     return (word or "").lower() in t.lower()
 
-def _gen_example_sentence(word: str, lang_code: str, context_hint: str = "", difficulty: str | None = None) -> str:
+# ✅ フォールバック廃止・緩和版（失敗は None を返す）
+def _gen_example_sentence(word: str, lang_code: str, context_hint: str = "", difficulty: str | None = None) -> str | None:
     lang_name = LANG_NAME.get(lang_code, "English")
     ctx = (context_hint or "").strip()
     rules = _lang_rules(lang_code)
@@ -470,7 +473,8 @@ def _gen_example_sentence(word: str, lang_code: str, context_hint: str = "", dif
         if ctx:
             user += f" Scene hint: {ctx}"
 
-    for _ in range(6):
+    # 再生成は3回、判定は緩め（文数2まで、monolingual厳格チェックなし）
+    for _ in range(3):
         try:
             rsp = GPT.chat.completions.create(
                 model="gpt-4o-mini",
@@ -479,38 +483,30 @@ def _gen_example_sentence(word: str, lang_code: str, context_hint: str = "", dif
                 top_p=0.9,
             )
             raw = (rsp.choices[0].message.content or "").strip()
-        except Exception:
+        except Exception as e:
+            logging.warning(f"Example generation API error: {e}")
             raw = ""
+
         cand = _clean_strict(raw)
         FALLBACK_STATS["example_attempts"] += 1
-        if not _monolingual_ok(cand, lang_code):
-            continue
-        valid = bool(cand) and _is_single_sentence(cand) and _fits_length(cand, lang_code)
+
+        # 文数・長さのみ軽くチェック（2文まで/長さ緩和済み）
+        valid = bool(cand) and _fits_length(cand, lang_code)
         try:
             contains_word = _contains_word_relaxed(word, cand, lang_code)
         except Exception:
             contains_word = True
+
         if valid and contains_word:
+            # 句点が多すぎる場合は2文で打ち切り
+            s = re.split(r"[。.!?！？]", cand)
+            if len([x for x in s if x.strip()]) > 2:
+                cand = _ensure_period_for_sentence("".join(s[:2]).strip(), lang_code)
             return _ensure_period_for_sentence(cand, lang_code)
 
-    # フェールセーフ（バックアップ例文）
+    # ❌ フォールバックはしない：失敗は失敗として上位でスキップ
     FALLBACK_STATS["example_fallbacks"] += 1
-    if lang_code == "ja":
-        return _ja_template_fallback(word)
-    elif lang_code == "ko":
-        return _ensure_period_for_sentence(f"{word}를 연습해 봅시다", lang_code)
-    elif lang_code == "zh":
-        return _ensure_period_for_sentence(f"让我们练习{word}", lang_code)
-    elif lang_code == "es":
-        return _ensure_period_for_sentence(f"Practiquemos {word}", lang_code)
-    elif lang_code == "pt":
-        return _ensure_period_for_sentence(f"Vamos praticar {word}", lang_code)
-    elif lang_code == "fr":
-        return _ensure_period_for_sentence(f"Pratiquons {word}", lang_code)
-    elif lang_code == "id":
-        return _ensure_period_for_sentence(f"Ayo berlatih {word}", lang_code)
-    else:
-        return _ensure_period_for_sentence(f"Let's practice {word}", lang_code)
+    return None
 
 def _extract_words(text: str, lang_code: str, n: int, banned: set[str]) -> list[str]:
     """
@@ -642,7 +638,7 @@ def _gen_vocab_list(theme: str, lang_code: str, n: int) -> list[str]:
         print(f"[FALLBACK] insufficient vocab for {theme} ({lang_code}), got {len(words)}")
         FALLBACKS = {
             "ja": ["ホテル", "旅行", "レストラン", "買い物", "空港", "食べ物", "時間", "地図", "支払い"],
-            "ko": ["호텔", "여행", "식당", "쇼핑", "공항", "음식", "시간", "지도", "결제"],
+            "ko": ["ホテル", "旅行", "食당", "쇼핑", "공항", "음식", "시간", "지도", "결제"],
             "zh": ["酒店", "旅行", "餐厅", "购物", "机场", "食物", "时间", "地图", "付款"],
             "es": ["hotel", "viaje", "restaurante", "compras", "aeropuerto", "comida", "tiempo", "mapa", "pago"],
             "pt": ["hotel", "viagem", "restaurante", "compras", "aeroporto", "comida", "tempo", "mapa", "pagamento"],
@@ -914,7 +910,7 @@ def _pick_unique_words(theme: str, audio_lang: str, n: int, base_spec: dict | No
     if len(words) < n:
         FALLBACKS = {
             "ja": ["チェックイン", "予約", "チェックアウト", "領収書", "エレベーター", "ロビー", "アップグレード", "領域", "清掃"],
-            "ko": ["체크인", "예약", "체크아웃", "영수증", "엘리베이터", "로비", "업그레이드", "청소", "객실"],
+            "ko": ["체크인", "예약", "체크아웃", "영수증", "엘리ベ이터", "로비", "업그레이드", "청소", "객실"],
             "zh": ["办理入住", "预订", "退房", "发票", "电梯", "大堂", "升级", "房间"],
             "es": ["registro", "reserva", "salida", "recibo", "ascensor", "vestíbulo", "mejora"],
             "pt": ["check-in", "reserva", "checkout", "recibo", "elevador", "saguão", "upgrade"],
@@ -1051,6 +1047,12 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
                 ex = _gen_example_sentence(w, audio_lang, master_context, difficulty=difficulty_for_this)
             else:
                 ex = _gen_example_sentence(w, audio_lang, master_context)
+
+            # ❗例文取得に失敗した語はスキップ（フォールバック禁止）
+            if ex is None or not ex.strip():
+                logging.warning(f"[SKIP] example generation failed for '{w}' ({audio_lang})")
+                continue
+
             round_examples.append(ex)
 
             # 単語
@@ -1132,7 +1134,7 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
                     sub_rows[r].append(_clean_sub_line(trans, lang))
 
         # 3) まとめ会話（このラウンドの語を全部使う）
-        if not NO_CONVO:
+        if not NO_CONVO and round_examples:
             convo = _gen_conversation_using_words(words_round, audio_lang, lines_per_round=CONVO_LINES)
             for spk, line in convo:
                 if audio_lang == "ja":

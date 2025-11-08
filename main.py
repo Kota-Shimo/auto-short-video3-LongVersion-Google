@@ -89,6 +89,31 @@ BANNED_COMMON_BY_LANG = {
 # ───────────────────────────────────────────────
 _VALID_CEFR = {"A1","A2","B1","B2"}
 
+# ★ 追加：CEFR → 各言語の試験ラベルに変換
+def _exam_label_for(lang_code: str, cefr: str) -> str:
+    c = (cefr or "").upper()
+    if lang_code == "ja":  # JLPT
+        m = {"A1": "JLPT N5", "A2": "JLPT N4", "B1": "JLPT N3", "B2": "JLPT N2"}
+        return m.get(c, f"JLPT ({c})")
+    if lang_code == "ko":  # TOPIK
+        m = {"A1": "TOPIK I (Lv.1)", "A2": "TOPIK I (Lv.2)", "B1": "TOPIK II (Lv.3)", "B2": "TOPIK II (Lv.4)"}
+        return m.get(c, f"TOPIK ({c})")
+    if lang_code == "zh":  # HSK
+        m = {"A1": "HSK 1", "A2": "HSK 2", "B1": "HSK 3", "B2": "HSK 4"}
+        return m.get(c, f"HSK ({c})")
+    if lang_code == "es":  # DELE
+        return f"DELE {c}"
+    if lang_code == "fr":  # DELF
+        return f"DELF {c}"
+    if lang_code == "pt":  # CELPE-Bras（近似）
+        m = {"A1": "CELPE-Bras Básico", "A2": "CELPE-Bras Intermediário",
+             "B1": "CELPE-Bras Intermediário Superior", "B2": "CELPE-Bras Avançado"}
+        return m.get(c, f"CELPE-Bras ({c})")
+    if lang_code == "id":  # UKBI
+        m = {"A1": "UKBI Dasar", "A2": "UKBI Menengah", "B1": "UKBI Madya", "B2": "UKBI Unggul"}
+        return m.get(c, f"UKBI ({c})")
+    return f"CEFR {c}"
+
 def _pick_difficulty_for_video() -> str:
     explicit = os.getenv("CEFR_LEVEL", "").strip().upper()
     if explicit in _VALID_CEFR:
@@ -445,7 +470,7 @@ def _gen_example_sentence(word: str, lang_code: str, context_hint: str = "", dif
         user = (
             f"{rules} "
             f"다음 단어를 반드시 포함하여 한국어로 자연스러운 문장을 정확히 1개만 쓰세요: {word} "
-            "대괄호나 번역 메모 금지. 영문자使用 금지."
+            "대괄호나 번역 메モ 금지. 영문자使用 금지."
             "가능하면 기본형에 가깝게 쓰되, 부자연스러우면 활용해도 됩니다."
             f"{level_line}"
         )
@@ -725,7 +750,7 @@ def _gen_vocab_list_from_spec(spec: dict, lang_code: str) -> list[str]:
             try:
                 rsp2 = GPT.chat.completions.create(
                     model="gpt-4o-mini",
-                    messages=[{"role":"user","content":prompt2}],
+                    messages={[{"role":"user","content":prompt2}][0:1] + [{"role":"user","content":prompt2}]},  # keep same structure
                     temperature=LIST_TEMP + 0.1 * attempt,
                     top_p=0.9,
                 )
@@ -967,8 +992,8 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
 
     # 全体統一の難易度（環境変数で固定 or ランダム）
     difficulty_for_all = _pick_difficulty_for_video()
-    # ★ ラベル類（CEFR / 試験）をここで集約
-    difficulty_label_for_all = f"CEFR {difficulty_for_all}"
+    # ★ ラベル類（CEFR / 試験）をここで集約 → 試験ラベルに置換
+    difficulty_label_for_all = _exam_label_for(audio_lang, difficulty_for_all)
     exam_for_all, exam_level_for_all = "", ""
 
     # テーマ/文脈/単語取得の根拠（全体で統一）
@@ -988,7 +1013,7 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
             pos_for_all      = spec.get("pos") or None
             pattern_for_all  = spec.get("pattern_hint") or None
             difficulty_for_all = (spec.get("difficulty") or difficulty_for_all).upper()
-            difficulty_label_for_all = spec.get("difficulty_label") or f"CEFR {difficulty_for_all}"
+            difficulty_label_for_all = spec.get("difficulty_label") or _exam_label_for(audio_lang, difficulty_for_all)
             exam_for_all     = spec.get("exam") or ""
             exam_level_for_all = spec.get("exam_level") or ""
             base_spec = dict(spec)
@@ -1278,26 +1303,55 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
         "id": "Seri Real Practice",
     }
 
+    # ★ 置換：タイトルは VOCAB_WORDS を必ず含め、試験ラベルを表示。シリーズ名は付けない。
     def make_title(theme, title_lang: str, audio_lang_for_label: str | None = None,
                    pos: list[str] | None = None, difficulty: str | None = None,
                    pattern_hint: str | None = None, difficulty_label: str | None = None):
         """
-        形式：「<翻訳済みTopic>[ 語彙/Vocabulary] | <シリーズ名> (CEFR A2 / JLPT N4)」
+        タイトル方針：
+          - 必ず VOCAB_WORDS(N) を表示
+          - CEFR ではなく試験ラベル（difficulty_label）を表示
+          - 固定シリーズ名は付与しない
         """
-        series_name = SERIES_LABELS.get(title_lang, "Real Practice Series")
-        label = f" ({difficulty_label})" if difficulty_label else (f" (CEFR {difficulty})" if difficulty else "")
+        N = max(1, VOCAB_WORDS)
+        lab = (difficulty_label or (f"CEFR {difficulty}" if difficulty else "")).strip()
         try:
             theme_local = theme if title_lang == "en" else translate(theme, title_lang)
         except Exception:
             theme_local = theme
 
         if title_lang == "ja":
-            topic_part = f"{theme_local} 語彙" if INCLUDE_VOCAB_IN_TITLE else f"{theme_local}"
-        else:
-            topic_part = f"{theme_local} Vocabulary" if INCLUDE_VOCAB_IN_TITLE else f"{theme_local}"
+            # 例: 「空港で使える6語（JLPT N5）」
+            base = f"{theme_local}で使える{N}語"
+            return sanitize_title(f"{base}{f'（{lab}）' if lab else ''}")
 
-        title_raw = f"{topic_part} | {series_name}{label}"
-        return sanitize_title(title_raw)
+        if title_lang == "ko":
+            base = f"{theme_local}에서 자주 쓰는 {N}단어"
+            return sanitize_title(f"{base}{f' – {lab}' if lab else ''}")
+
+        if title_lang == "zh":
+            base = f"{theme_local}常用{N}词"
+            return sanitize_title(f"{base}{f' – {lab}' if lab else ''}")
+
+        if title_lang == "es":
+            base = f"{N} palabras para {theme_local}"
+            return sanitize_title(f"{base}{f' – {lab}' if lab else ''}")
+
+        if title_lang == "pt":
+            base = f"{N} palavras para {theme_local}"
+            return sanitize_title(f"{base}{f' – {lab}' if lab else ''}")
+
+        if title_lang == "fr":
+            base = f"{N} mots pour {theme_local}"
+            return sanitize_title(f"{base}{f' – {lab}' if lab else ''}")
+
+        if title_lang == "id":
+            base = f"{N} kosakata untuk {theme_local}"
+            return sanitize_title(f"{base}{f' – {lab}' if lab else ''}")
+
+        # 既定（英語）
+        base = f"{N} words for {theme_local}"
+        return sanitize_title(f"{base}{f' – {lab}' if lab else ''}")
 
     def make_desc(theme, title_lang: str, difficulty_label: str | None):
         if title_lang not in LANG_NAME:

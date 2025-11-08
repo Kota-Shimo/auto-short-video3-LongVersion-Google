@@ -2,9 +2,11 @@ name: Auto-Vocab-Daily
 
 on:
   schedule:
-    - cron: '0 19 * * *'   # JST04:00 → パターン①（会話なし）
-    #- cron: '0 9  * * *'   # JST18:00 → パターン②（最後に会話1ブロック）
-    #- cron: '0 15 * * *'   # JST00:00 → パターン③（毎ラウンド会話）
+    - cron: '0 19 * * *'   # JST04:00 → Pattern①(会話なし) Group A acc1–3
+    - cron: '0 21 * * *'   # JST06:00 → Pattern①(会話なし) Group B acc4–6
+    - cron: '0 3  * * *'   # JST12:00 → Pattern①(会話なし) Group C acc7–9
+    #- cron: '0 9  * * *'   # JST18:00 → Pattern②（最後に会話1ブロック）
+    #- cron: '0 15 * * *'   # JST00:00 → Pattern③（毎ラウンド会話）
   workflow_dispatch:
     inputs:
       mode:
@@ -13,11 +15,11 @@ on:
         default: "no-convo"
         type: choice
         options:
-          - no-convo      # ① 単語＋例文のみ
-          - final-convo   # ② 最後に会話1ブロック
-          - every-convo   # ③ 各ラウンドで会話
+          - no-convo
+          - final-convo
+          - every-convo
       target:
-        description: "アップロード先アカウント（acc1〜acc9）。空なら全アカウント"
+        description: "アップロード先アカウント（acc1〜acc9）。空なら時間帯グループ全実行"
         required: false
         default: ""
 
@@ -30,9 +32,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 800
     env:
-      # 手動実行時: ここに inputs.target が入る / スケジュール時: 空（→ 全アカウント）
-      TARGET_ACCOUNT: ${{ github.event.inputs.target }}
-      # ← ここで Google TTS を有効化（OpenAIへ戻すときは "0"）
       USE_GOOGLE_TTS: "1"
 
     steps:
@@ -48,7 +47,7 @@ jobs:
       - name: 📦 Install requirements
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y ffmpeg coreutils
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
@@ -73,7 +72,6 @@ jobs:
             fi
           done
 
-      # ===== Google Cloud TTS 鍵を復元（Secrets: GCP_TTS_KEY_B64） =====
       - name: 🔐 Restore GCP TTS key
         run: echo "$GCP_TTS_KEY_B64" | base64 -d > gcp_tts_key.json
         env:
@@ -82,27 +80,55 @@ jobs:
       - name: 🌍 Set GOOGLE_APPLICATION_CREDENTIALS
         run: echo "GOOGLE_APPLICATION_CREDENTIALS=$PWD/gcp_tts_key.json" >> $GITHUB_ENV
 
-      # ──────────────── パターン① 単語＋例文のみ ────────────────
-      # スケジュール: 0 19 * * *（JST04:00）
-      # 手動: inputs.mode == no-convo
-      - name: 🎬 Pattern ① Vocab + Example only
+      # ─────────────── Pattern① 会話なし (時間帯ごと分割) ───────────────
+      - name: 🎬 Pattern① no-convo (by group)
         if: |
           github.event.schedule == '0 19 * * *' ||
+          github.event.schedule == '0 21 * * *' ||
+          github.event.schedule == '0 3 * * *' ||
           (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'no-convo')
         env:
           OPENAI_API_KEY:      ${{ secrets.OPENAI_API_KEY }}
           UNSPLASH_ACCESS_KEY: ${{ secrets.UNSPLASH_ACCESS_KEY }}
           VOCAB_WORDS:         100
           WORD_REPEAT:         2
-          NO_CONVO:            "1"     # ← 会話なし
-          TARGET_ACCOUNT:      ${{ env.TARGET_ACCOUNT }}
+          NO_CONVO:            "1"
         run: |
-          python main.py AUTO --privacy public --chunk 120
+          set -e
+          # 時間帯ごとに対象グループを自動決定
+          case "${{ github.event.schedule }}" in
+            '0 19 * * *') ACCS="acc1 acc2 acc3" ;;
+            '0 21 * * *') ACCS="acc4 acc5 acc6" ;;
+            '0 3 * * *')  ACCS="acc7 acc8 acc9" ;;
+            *)            ACCS="acc1 acc2 acc3 acc4 acc5 acc6 acc7 acc8 acc9" ;;
+          esac
 
-      # ──────────────── パターン② 最後に会話 ────────────────
-      # スケジュール: 0 9 * * *（JST18:00）
-      # 手動: inputs.mode == final-convo
-      - name: 🎬 Pattern ② Vocab + Example + Final Convo
+          if [ -n "${{ github.event.inputs.target }}" ]; then
+            ACCS="${{ github.event.inputs.target }}"
+          fi
+
+          echo "▶ Accounts: $ACCS"
+          mkdir -p runlogs
+          for acc in $ACCS; do
+            echo "──────────────────────────────"
+            echo "🎯 Running no-convo for $acc"
+            export TARGET_ACCOUNT="$acc"
+
+            set +e
+            timeout 180m python main.py AUTO --privacy public --chunk 120 \
+              > runlogs/${acc}.out.log 2> runlogs/${acc}.err.log
+            CODE=$?
+            set -e
+            if [ $CODE -eq 0 ]; then
+              echo "✅ $acc finished OK"
+            else
+              echo "⚠️ $acc failed ($CODE), continue"
+            fi
+          done
+          echo "✅ All done for this timeslot group"
+
+      # ─────────────── Pattern② 最後に会話 ───────────────
+      - name: 🎬 Pattern② Final Convo
         if: |
           github.event.schedule == '0 9 * * *' ||
           (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'final-convo')
@@ -117,10 +143,8 @@ jobs:
         run: |
           python main.py AUTO --privacy public --chunk 120
 
-      # ──────────────── パターン③ 各ラウンドごとに会話 ────────────────
-      # スケジュール: 0 15 * * *（JST00:00）
-      # 手動: inputs.mode == every-convo
-      - name: 🎬 Pattern ③ Every-round Convo
+      # ─────────────── Pattern③ 各ラウンドで会話 ───────────────
+      - name: 🎬 Pattern③ Every-round Convo
         if: |
           github.event.schedule == '0 15 * * *' ||
           (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'every-convo')

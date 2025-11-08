@@ -33,6 +33,8 @@ jobs:
     timeout-minutes: 800
     env:
       USE_GOOGLE_TTS: "1"
+      # ②③が従来通り inputs.target を参照できるよう維持
+      TARGET_ACCOUNT: ${{ github.event.inputs.target }}
 
     steps:
       - name: ⬇️ Checkout repo
@@ -80,8 +82,8 @@ jobs:
       - name: 🌍 Set GOOGLE_APPLICATION_CREDENTIALS
         run: echo "GOOGLE_APPLICATION_CREDENTIALS=$PWD/gcp_tts_key.json" >> $GITHUB_ENV
 
-      # ─────────────── Pattern① 会話なし (時間帯ごと分割) ───────────────
-      - name: 🎬 Pattern① no-convo (by group)
+      # ─────────────── Pattern① 会話なし (時間帯ごと分割・失敗で即停止) ───────────────
+      - name: 🎬 Pattern① no-convo (by group, fail-fast)
         if: |
           github.event.schedule == '0 19 * * *' ||
           github.event.schedule == '0 21 * * *' ||
@@ -94,7 +96,7 @@ jobs:
           WORD_REPEAT:         2
           NO_CONVO:            "1"
         run: |
-          set -e
+          set -euo pipefail
           # 時間帯ごとに対象グループを自動決定
           case "${{ github.event.schedule }}" in
             '0 19 * * *') ACCS="acc1 acc2 acc3" ;;
@@ -103,31 +105,29 @@ jobs:
             *)            ACCS="acc1 acc2 acc3 acc4 acc5 acc6 acc7 acc8 acc9" ;;
           esac
 
+          # 手動実行時 target 優先（スペース区切り想定）
           if [ -n "${{ github.event.inputs.target }}" ]; then
             ACCS="${{ github.event.inputs.target }}"
           fi
 
           echo "▶ Accounts: $ACCS"
           mkdir -p runlogs
+
           for acc in $ACCS; do
             echo "──────────────────────────────"
             echo "🎯 Running no-convo for $acc"
             export TARGET_ACCOUNT="$acc"
 
-            set +e
+            # 失敗した時点で即終了（ログは個別に保存）
             timeout 180m python main.py AUTO --privacy public --chunk 120 \
-              > runlogs/${acc}.out.log 2> runlogs/${acc}.err.log
-            CODE=$?
-            set -e
-            if [ $CODE -eq 0 ]; then
-              echo "✅ $acc finished OK"
-            else
-              echo "⚠️ $acc failed ($CODE), continue"
-            fi
+              > "runlogs/${acc}.out.log" 2> "runlogs/${acc}.err.log"
+
+            echo "✅ $acc finished OK"
           done
+
           echo "✅ All done for this timeslot group"
 
-      # ─────────────── Pattern② 最後に会話 ───────────────
+      # ─────────────── Pattern② 最後に会話（従来どおり） ───────────────
       - name: 🎬 Pattern② Final Convo
         if: |
           github.event.schedule == '0 9 * * *' ||
@@ -143,7 +143,7 @@ jobs:
         run: |
           python main.py AUTO --privacy public --chunk 120
 
-      # ─────────────── Pattern③ 各ラウンドで会話 ───────────────
+      # ─────────────── Pattern③ 各ラウンドで会話（従来どおり） ───────────────
       - name: 🎬 Pattern③ Every-round Convo
         if: |
           github.event.schedule == '0 15 * * *' ||

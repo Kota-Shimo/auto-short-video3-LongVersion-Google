@@ -4,7 +4,7 @@ on:
   schedule:
     - cron: '0 19 * * *'   # JST04:00 → Pattern①(会話なし) Group A acc1–3
     - cron: '0 21 * * *'   # JST06:00 → Pattern①(会話なし) Group B acc4–6
-    - cron: '0 3  * * *'   # JST12:00 → Pattern①(会話なし) Group C acc7–9
+    - cron: '0 3 * * *'   # JST12:00 → Pattern①(会話なし) Group C acc7–9
     #- cron: '0 9  * * *'   # JST18:00 → Pattern②（最後に会話1ブロック）
     #- cron: '0 15 * * *'   # JST00:00 → Pattern③（毎ラウンド会話）
   workflow_dispatch:

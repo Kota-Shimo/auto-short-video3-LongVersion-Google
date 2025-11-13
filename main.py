@@ -1,3 +1,8 @@
+現在は下記です。
+修正したのを全文でお願いします。
+他の部分は崩さないようにしてください。
+
+
 #!/usr/bin/env python
 """
 main.py – VOCAB専用ロング動画（横向き16:9 / ラウンド制 / 日本語TTS最適化）
@@ -89,32 +94,30 @@ BANNED_COMMON_BY_LANG = {
 # ───────────────────────────────────────────────
 _VALID_CEFR = {"A1","A2","B1","B2"}
 
-# ★ 変更点①：CEFR → 試験ラベル。未対応は空文字（CEFRにフォールバックしない）
+# ★ 追加：CEFR → 各言語の試験ラベルに変換
 def _exam_label_for(lang_code: str, cefr: str) -> str:
     c = (cefr or "").upper()
-    if lang_code == "en":  # 英語は表記なし（統一のため空）
-        return ""
     if lang_code == "ja":  # JLPT
         m = {"A1": "JLPT N5", "A2": "JLPT N4", "B1": "JLPT N3", "B2": "JLPT N2"}
-        return m.get(c, "")
+        return m.get(c, f"JLPT ({c})")
     if lang_code == "ko":  # TOPIK
         m = {"A1": "TOPIK I (Lv.1)", "A2": "TOPIK I (Lv.2)", "B1": "TOPIK II (Lv.3)", "B2": "TOPIK II (Lv.4)"}
-        return m.get(c, "")
+        return m.get(c, f"TOPIK ({c})")
     if lang_code == "zh":  # HSK
         m = {"A1": "HSK 1", "A2": "HSK 2", "B1": "HSK 3", "B2": "HSK 4"}
-        return m.get(c, "")
+        return m.get(c, f"HSK ({c})")
     if lang_code == "es":  # DELE
-        return f"DELE {c}" if c in _VALID_CEFR else ""
+        return f"DELE {c}"
     if lang_code == "fr":  # DELF
-        return f"DELF {c}" if c in _VALID_CEFR else ""
+        return f"DELF {c}"
     if lang_code == "pt":  # CELPE-Bras（近似）
         m = {"A1": "CELPE-Bras Básico", "A2": "CELPE-Bras Intermediário",
              "B1": "CELPE-Bras Intermediário Superior", "B2": "CELPE-Bras Avançado"}
-        return m.get(c, "")
+        return m.get(c, f"CELPE-Bras ({c})")
     if lang_code == "id":  # UKBI
         m = {"A1": "UKBI Dasar", "A2": "UKBI Menengah", "B1": "UKBI Madya", "B2": "UKBI Unggul"}
-        return m.get(c, "")
-    return ""  # ← デフォは空（CEFR表記を出さない）
+        return m.get(c, f"UKBI ({c})")
+    return f"CEFR {c}"
 
 def _pick_difficulty_for_video() -> str:
     explicit = os.getenv("CEFR_LEVEL", "").strip().upper()
@@ -472,7 +475,7 @@ def _gen_example_sentence(word: str, lang_code: str, context_hint: str = "", dif
         user = (
             f"{rules} "
             f"다음 단어를 반드시 포함하여 한국어로 자연스러운 문장을 정확히 1개만 쓰세요: {word} "
-            "대괄호나 번역 메모 금지. 영문자使用 금지."
+            "대괄호나 번역 메モ 금지. 영문자使用 금지."
             "가능하면 기본형에 가깝게 쓰되, 부자연스러우면 활용해도 됩니다."
             f"{level_line}"
         )
@@ -665,7 +668,7 @@ def _gen_vocab_list(theme: str, lang_code: str, n: int) -> list[str]:
         print(f"[FALLBACK] insufficient vocab for {theme} ({lang_code}), got {len(words)}")
         FALLBACKS = {
             "ja": ["ホテル", "旅行", "レストラン", "買い物", "空港", "食べ物", "時間", "地図", "支払い"],
-            "ko": ["ホテル", "旅行", "식당", "쇼핑", "공항", "음식", "시간", "지도", "결제"],
+            "ko": ["호텔", "여행", "식당", "쇼핑", "공항", "음식", "시간", "지도", "결제"],
             "zh": ["酒店", "旅行", "餐厅", "购物", "机场", "食物", "时间", "地图", "付款"],
             "es": ["hotel", "viaje", "restaurante", "compras", "aeropuerto", "comida", "tiempo", "mapa", "pago"],
             "pt": ["hotel", "viagem", "restaurante", "compras", "aeroporto", "comida", "tempo", "mapa", "pagamento"],
@@ -943,7 +946,7 @@ def _pick_unique_words(theme: str, audio_lang: str, n: int, base_spec: dict | No
     if len(words) < n:
         FALLBACKS = {
             "ja": ["チェックイン", "予約", "チェックアウト", "領収書", "エレベーター", "ロビー", "アップグレード", "領域", "清掃"],
-            "ko": ["체크인", "예약", "체크아웃", "영수증", "엘리베이터", "로비", "업그레이드", "청소", "客室"],
+            "ko": ["체크인", "예약", "체크아웃", "영수증", "엘리베이터", "로비", "업그레이드", "청소", "객室"],
             "zh": ["办理入住", "预订", "退房", "发票", "电梯", "大堂", "升级", "房间"],
             "es": ["registro", "reserva", "salida", "recibo", "ascensor", "vestíbulo", "mejora"],
             "pt": ["check-in", "reserva", "checkout", "recibo", "elevador", "saguão", "upgrade"],
@@ -1015,9 +1018,7 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
             pos_for_all      = spec.get("pos") or None
             pattern_for_all  = spec.get("pattern_hint") or None
             difficulty_for_all = (spec.get("difficulty") or difficulty_for_all).upper()
-            # ★ 変更点②：空なら_exam_label_forで補完（CEFRに戻らない）
-            _dl = (spec.get("difficulty_label") or "").strip()
-            difficulty_label_for_all = _dl or _exam_label_for(audio_lang, difficulty_for_all)
+            difficulty_label_for_all = spec.get("difficulty_label") or _exam_label_for(audio_lang, difficulty_for_all)
             exam_for_all     = spec.get("exam") or ""
             exam_level_for_all = spec.get("exam_level") or ""
             base_spec = dict(spec)
@@ -1316,10 +1317,9 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
           - 必ず VOCAB_WORDS(N) を表示
           - CEFR ではなく試験ラベル（difficulty_label）を表示
           - 固定シリーズ名は付与しない
-        */
+        """
         N = max(1, VOCAB_WORDS)
-        # ★ 変更点③：CEFRフォールバック禁止
-        lab = (difficulty_label or "").strip()
+        lab = (difficulty_label or (f"CEFR {difficulty}" if difficulty else "")).strip()
         try:
             theme_local = theme if title_lang == "en" else translate(theme, title_lang)
         except Exception:
@@ -1386,9 +1386,8 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
         ]
         if difficulty_label:
             tags.append(difficulty_label)
-        # ★ 変更点④：CEFRタグへのフォールバックを削除
-        # elif difficulty:
-        #     tags.append(f"CEFR {difficulty}")
+        elif difficulty:
+            tags.append(f"CEFR {difficulty}")
         if exam and exam_level:
             tags.append(f"{exam} {exam_level}")
         if pos:

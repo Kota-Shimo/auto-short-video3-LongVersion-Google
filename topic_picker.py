@@ -1,11 +1,11 @@
-# topic_picker.py – vocab専用：機能→シーン→パターンを難易度連動の重みでランダム選択
+# topic_picker.py – VOCAB専用：語彙カテゴリ（試験・コア語彙・日常会話など）＋難易度ベース
 import os
 import random
 from typing import List, Tuple, Dict
 
 rng = random.SystemRandom()
 
-# ========== 定義 ==========
+# ========== 既存定義（例文側・後方互換用に残す） ==========
 # 機能（Functional）＝「何をしたいか」の核
 FUNCTIONALS = [
     "greetings & introductions",
@@ -232,9 +232,19 @@ SCENE_WEIGHTS_BY_LEVEL: Dict[str, Dict[str, int]] = {
     },
 }
 
+# ========== 語彙カテゴリ（単語用）定義 ==========
+# 単語は「functional/scene」ではなく、このカテゴリ＋CEFRで選ぶ
+VOCAB_SOURCES = {
+    "exam_core": "exam core vocabulary",             # 試験頻出・アカデミックより
+    "core_general": "core general vocabulary",       # NGSL 等のコア語彙
+    "daily_conversation": "everyday spoken vocabulary",  # 日常会話でよく使う
+    "survival_travel": "travel & survival vocabulary",   # 旅行・生活サバイバル
+    "idioms_phrasal": "idioms & phrasal verbs",      # 熟語・句動詞系
+}
+
 def _env_level() -> str:
     v = os.getenv("CEFR_LEVEL", "").strip().upper()
-    # ENV が有効ならそれ、無ければ A2/B1/B2 からランダム（= Shorts 風の自動）
+    # ENV が有効ならそれ、無ければ A2/B1/B2 からランダム（= 既存互換）
     return v if v in ("A1", "A2", "B1", "B2") else rng.choice(["A2", "B1", "B2"])
 
 def _choose_weighted(items: List[Tuple[str, int]]) -> str:
@@ -245,6 +255,7 @@ def _weights_from_dict(keys: List[str], table: Dict[str, int]) -> List[Tuple[str
     return [(k, table.get(k, 1)) for k in keys]
 
 def _pick_functional() -> str:
+    # いまは単語では使わないが、後方互換用に残す
     override = os.getenv("FUNCTIONAL_OVERRIDE", "").strip()
     if override:
         return override
@@ -254,6 +265,7 @@ def _pick_functional() -> str:
     return _choose_weighted(items)
 
 def _pick_scene(functional: str) -> str:
+    # いまは単語では使わないが、後方互換用に残す
     override = os.getenv("SCENE_OVERRIDE", "").strip()
     if override:
         return override
@@ -272,6 +284,7 @@ def _pick_scene(functional: str) -> str:
     return _choose_weighted(items)
 
 def _pick_pattern(functional: str, scene: str) -> str:
+    # 例文用の pattern。単語では使わないがキーだけ残す。
     override = os.getenv("PATTERN_HINT", "").strip()
     if override:
         return override
@@ -363,73 +376,130 @@ def _difficulty_metadata(audio_lang: str, cefr: str) -> Dict[str, str]:
         "exam_level": exam_level,
     }
 
-def _build_spec(functional: str, scene: str, audio_lang: str) -> dict:
-    # テーマは機能＋シーンを併記（タイトル側で自然に短縮される）
-    theme = f"{functional} – {scene}"
+# ─────────────────────────────────────────
+# 単語専用：語彙カテゴリ＋難易度ベースの spec を組み立てる
+# ─────────────────────────────────────────
+def _pick_lex_source(audio_lang: str) -> str:
+    """
+    単語用の語彙カテゴリを選ぶ。
+    ENV:
+      - LEX_SOURCE=exam_core/core_general/... で強制指定可能。
+    """
+    override = os.getenv("LEX_SOURCE", "").strip()
+    if override and override in VOCAB_SOURCES:
+        return override
 
+    # デフォルトの重み（長尺向けにバランス良く）
+    base_weights = {
+        "exam_core": 3,
+        "core_general": 4,
+        "daily_conversation": 3,
+        "survival_travel": 2,
+        "idioms_phrasal": 2,
+    }
+
+    # 言語別に少しだけ傾向を変えたい場合はここで調整
+    lang = (audio_lang or "").lower()
+    if lang == "ja":
+        # 日本語：JLPT＋日常会話を少し厚めに
+        base_weights["exam_core"] += 1
+        base_weights["daily_conversation"] += 1
+    elif lang == "ko":
+        base_weights["exam_core"] += 1
+    elif lang == "es":
+        base_weights["daily_conversation"] += 1
+
+    items = list(base_weights.items())
+    return _choose_weighted(items)
+
+def _build_vocab_spec(audio_lang: str) -> dict:
+    """
+    単語（vocab）専用 spec。
+    functional / scene は使わず、
+    - lex_source（語彙カテゴリ）
+    - difficulty（CEFR / 試験ラベル）
+    だけで単語を選ぶ。
+    """
     cefr = _random_difficulty()
     meta = _difficulty_metadata(audio_lang, cefr)
+    lex_source = _pick_lex_source(audio_lang)
+    lex_label = VOCAB_SOURCES.get(lex_source, lex_source)
 
     spec = {
-        "theme": theme,
-        "context": _context_for_theme(functional, scene),
+        # vocab では「テーマ文脈」は使わないので空にしておく
+        "theme": "",
+        "context": "",
         "count": int(os.getenv("VOCAB_WORDS", "6")),
-        "pos": _random_pos_from_env_or_default(),            # POSはENV優先（未指定なら main.py 側で言語別推定が安全）
-        "relation_mode": os.getenv("RELATION_MODE", "").strip().lower(),  # 未指定なら空
-        "difficulty": cefr,                                   # CEFR A1/A2/B1/B2
-        "difficulty_label": meta["label"],                    # 例: "CEFR A2 / JLPT N4"
-        "exam": meta["exam"],                                 # 例: "JLPT"
-        "exam_level": meta["exam_level"],                     # 例: "N4"
-        "pattern_hint": _pick_pattern(functional, scene),
+        "pos": _random_pos_from_env_or_default(),
+        "relation_mode": os.getenv("RELATION_MODE", "").strip().lower(),
+        "difficulty": cefr,                     # CEFR A1/A2/B1/B2
+        "difficulty_label": meta["label"],      # 例: "CEFR A2 / JLPT N4"
+        "exam": meta["exam"],                   # 例: "JLPT"
+        "exam_level": meta["exam_level"],       # 例: "N4"
+        # vocab では pattern は使わないので空
+        "pattern_hint": "",
         "morphology": _parse_csv_env("MORPHOLOGY"),
+        # 新規：語彙カテゴリ
+        "lex_source": lex_source,               # 例: "exam_core"
+        "lex_source_label": lex_label,          # 例: "exam core vocabulary"
     }
     return spec
+
+# 既存シグネチャを壊さないラッパー（外部から直接呼ばれていても安全）
+def _build_spec(functional: str, scene: str, audio_lang: str) -> dict:
+    """
+    後方互換用：以前は functional/scene ベースだったが、
+    いまは vocab 用の _build_vocab_spec に委譲する。
+    functional/scene は無視される。
+    """
+    return _build_vocab_spec(audio_lang)
 
 # ========== 外部API ==========
 def pick_by_content_type(content_type: str, audio_lang: str, return_context: bool = False):
     """
     vocab の場合：
-      1) Functional を難易度連動の重みで選ぶ
-      2) その Functional に相性の良い Scene を重みで選ぶ（難易度も反映）
-      3) pattern_hint も上記に連動して重み選択
+      - functional / scene は使わず、
+        語彙カテゴリ（lex_source）＋難易度で単語セットを決定する。
     ENV:
       - CEFR_LEVEL=A1/A2/B1/B2 で難易度固定
-      - FUNCTIONAL_OVERRIDE / SCENE_OVERRIDE / PATTERN_HINT で強制上書き
-      - THEME_OVERRIDE: theme 文字列を丸ごと上書き（return_context=Falseの互換用途）
+      - LEX_SOURCE=exam_core/core_general/... で語彙カテゴリ固定
+      - THEME_OVERRIDE: return_context=False のときだけ、タイトル文字列を上書き
     """
     ct = (content_type or "vocab").lower()
-    if ct != "vocab":
-        if return_context:
-            # 非 vocab の後方互換
-            theme = "general vocabulary"
-            return {
-                "theme": theme,
-                "context": "A simple everyday situation with polite, practical language.",
-                "count": int(os.getenv("VOCAB_WORDS", "6")),
-                "pos": [],
-                "relation_mode": "",
-                "difficulty": _random_difficulty(),
-                "difficulty_label": f"CEFR {_random_difficulty()}",
-                "exam": "",
-                "exam_level": "",
-                "pattern_hint": "",
-                "morphology": [],
-            }
-        return "general vocabulary"
 
-    # 互換：THEME_OVERRIDE があればそれだけ返す
-    theme_override = os.getenv("THEME_OVERRIDE", "").strip()
-    if theme_override and not return_context:
-        return theme_override
+    # ── vocab 専用ロジック ─────────────────────
+    if ct == "vocab":
+        # タイトル文字列だけ欲しいときの互換
+        theme_override = os.getenv("THEME_OVERRIDE", "").strip()
+        if theme_override and not return_context:
+            return theme_override
 
-    # 新方式：functional → scene → pattern
-    functional = _pick_functional()
-    scene = _pick_scene(functional)
+        spec = _build_vocab_spec(audio_lang)
 
-    if not return_context:
-        return f"{functional} – {scene}"
+        if not return_context:
+            # サムネ用など：語彙カテゴリラベルをそのまま返す
+            return spec.get("lex_source_label") or "general vocabulary"
 
-    return _build_spec(functional, scene, audio_lang)
+        return spec
+
+    # ── 非 vocab（後方互換の簡易実装）─────────────────
+    if return_context:
+        theme = "general vocabulary"
+        diff = _random_difficulty()
+        return {
+            "theme": theme,
+            "context": "A simple everyday situation with polite, practical language.",
+            "count": int(os.getenv("VOCAB_WORDS", "6")),
+            "pos": [],
+            "relation_mode": "",
+            "difficulty": diff,
+            "difficulty_label": f"CEFR {diff}",
+            "exam": "",
+            "exam_level": "",
+            "pattern_hint": "",
+            "morphology": [],
+        }
+    return "general vocabulary"
 
 # ローカルテスト
 if __name__ == "__main__":

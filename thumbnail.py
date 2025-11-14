@@ -1,7 +1,7 @@
 # thumbnail.py – centered glass panel + two-line caption (scene / phrase)
 from pathlib import Path
 from io import BytesIO
-import textwrap, logging, requests
+import textwrap, logging, requests, os
 from PIL import (
     Image, ImageDraw, ImageFont, ImageFilter,
     ImageEnhance, ImageOps
@@ -83,7 +83,7 @@ BADGE_BASE   = "Lesson"
 BADGE_SIZE   = 60
 BADGE_POS    = (40, 30)
 
-# OpenAI クライアント（キー未設定でも落ちない）
+# OpenAI クライアント（今は使わないが互換のため残す）
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 # ------------------------------------------------------ Unsplash BG
@@ -111,55 +111,79 @@ def _unsplash(topic: str) -> Image.Image:
     img.alpha_composite(Image.new("RGBA", (W, H), (0, 0, 0, 77)))   # 30% dark veil
     return img
 
-# ------------------------------------------------------ GPT Caption (scene | phrase)
+# ------------------------------------------------------ Simple Caption (topic / words / CEFR)
 def _caption(topic: str, lang_code: str) -> str:
-    # 言語名を決定（未登録コードは English にフォールバック）
-    lang_name = LANG_NAME.get(lang_code, "English")
+    """
+    タイトルとのズレを減らすため、GPTには投げず、
+    - topic（テーマ）
+    - VOCAB_WORDS（単語数）
+    - CEFR_LEVEL（難易度）
+    だけで2行テキストを決める。
+    """
+    topic = (topic or "").strip() or "vocabulary"
 
-    prompt = (
-        "You craft clicky YouTube video thumbnails.\n"
-        f"Language: {lang_name} ONLY.\n"
-        "Task: Produce TWO ultra-short lines separated by a single '|' character:\n"
-        " - Line 1: the SCENE label (e.g., Hotel / Airport / Restaurant / At Work) — ≤ 16 chars.\n"
-        " - Line 2: the key PHRASE learners will master — ≤ 20 chars.\n"
-        "Rules: no quotes, no punctuation around the bar, no emojis, no translation, "
-        "use natural {lang} words, and avoid brand names.\n"
-        f"Topic: {topic}\n"
-        "Output format example:\n"
-        "Hotel|Check-in made easy"
-    ).replace("{lang}", lang_name)
+    # テーマのローカライズ
+    try:
+        if lang_code == "en":
+            theme_local = topic
+        else:
+            theme_local = translate(topic, lang_code) or topic
+    except Exception:
+        logging.exception("[thumb topic translate]")
+        theme_local = topic
+    theme_local = theme_local.strip()
 
-    txt = ""
-    if client:
+    # 単語数・CEFR
+    n_words = 0
+    env_words = os.getenv("VOCAB_WORDS", "").strip()
+    if env_words.isdigit():
         try:
-            txt = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.6
-            ).choices[0].message.content.strip()
+            n_words = max(1, int(env_words))
         except Exception:
-            logging.exception("[OpenAI caption]")
+            n_words = 0
+    level = os.getenv("CEFR_LEVEL", "").strip().upper()
 
-    # フォールバック（OpenAI失敗や空文字対策）
-    if not txt:
-        defaults = {
-            "ja": "ホテル|チェックインを頼む",
-            "en": "Hotel|Check-in made easy",
-            "ko": "호텔|체크인 쉽게",
-            "es": "Hotel|Check-in fácil",
-        }
-        txt = defaults.get(lang_code, "Hotel|Check-in made easy")
+    # 言語ごとの定型
+    if lang_code == "ja":
+        l1 = theme_local + " の語彙" if theme_local else "語彙レッスン"
+        parts = []
+        if n_words:
+            parts.append(f"{n_words}語")
+        if level:
+            parts.append(f"CEFR {level}")
+        if not parts:
+            parts.append("単語レッスン")
+        l2 = " ".join(parts)
+    elif lang_code == "en":
+        l1 = theme_local or "Vocabulary practice"
+        if n_words and level:
+            l2 = f"{n_words} words · CEFR {level}"
+        elif n_words:
+            l2 = f"{n_words} key words"
+        elif level:
+            l2 = f"CEFR {level} vocab"
+        else:
+            l2 = "Boost your vocabulary"
+    else:
+        l1 = theme_local or "Vocabulary practice"
+        if n_words and level:
+            base = f"{n_words} words · CEFR {level}"
+        elif n_words:
+            base = f"{n_words} key words"
+        elif level:
+            base = f"CEFR {level} vocabulary"
+        else:
+            base = "Vocabulary lesson"
+        try:
+            l2 = translate(base, lang_code) or base
+        except Exception:
+            logging.exception("[thumb caption translate]")
+            l2 = base
 
-    # フォーマット崩れの保険：パイプが無ければ擬似分割し、常に2行にする
-    parts = [p.strip() for p in txt.split("|") if p.strip()]
-    if len(parts) == 0:
-        parts = ["Everyday", "Speak now"]
-    elif len(parts) == 1:
-        seg = parts[0]
-        mid = max(1, min(len(seg) // 2, 16))
-        parts = [seg[:mid].strip() or "Everyday", seg[mid:].strip() or "Speak now"]
-
-    return f"{(parts[0] or 'Everyday')[:22]}|{(parts[1] or 'Speak now')[:24]}"  # 最終ガード
+    # 最終ガード＋長さ制限（もとの仕様に合わせる）
+    l1 = (l1 or "Everyday").strip()
+    l2 = (l2 or "Speak now").strip()
+    return f"{l1[:22]}|{l2[:24]}"
 
 # ------------------------------------------------------ helpers
 def _txt_size(draw: ImageDraw.ImageDraw, txt: str, font: ImageFont.FreeTypeFont):
@@ -177,7 +201,7 @@ def _draw(img: Image.Image, cap: str, badge_txt: str) -> Image.Image:
     l1, l2  = (cap.split("|") + [""])[:2]
     l1, l2  = l1.strip(), l2.strip()
 
-    # フォント読み込みを安全化（無くても落とさない）
+    # フォント読み込みを安全化（無くても落ちない）
     f1 = _load_font(pick_font(l1),          F_H1)
     f2 = _load_font(pick_font(l2 or l1),    F_H2)
 
@@ -247,10 +271,10 @@ def _draw(img: Image.Image, cap: str, badge_txt: str) -> Image.Image:
 def make_thumbnail(topic: str, lang_code: str, out: Path):
     """
     lang_code は main.py から渡される第二字幕言語（subs[1）を想定。
-    ここでは言語名に変換して GPT に明示するため、LANG_NAME を用いる。
+    ここでは theme/topic と単語数・CEFR をまとめたキャプションを描画する。
     """
     bg    = _unsplash(topic)
-    cap   = _caption(topic, lang_code)  # ← 安定して指定言語になる
+    cap   = _caption(topic, lang_code)
     try:
         badge = translate(BADGE_BASE, lang_code) or BADGE_BASE
     except Exception:

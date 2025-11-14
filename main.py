@@ -682,8 +682,13 @@ def _gen_vocab_list(theme: str, lang_code: str, n: int) -> list[str]:
     
 def _gen_vocab_list_from_spec(spec: dict, lang_code: str) -> list[str]:
     """
-    spec（theme/context/pos/relation_mode/difficulty/pattern_hint, difficulty_label, exam, exam_level）を尊重して語彙抽出。
-    まず spec 準拠で強プロンプト、足りない分は exclude 指定で追加生成、最後にフォールバック。
+    spec（theme/context/pos/relation_mode/difficulty/pattern_hint,
+          difficulty_label, exam, exam_level, lex_source など）を尊重して語彙抽出。
+
+    方針：
+      - lex_source / exam / difficulty を見て「試験頻出 / 日常会話 / ネイティブ表現」を切り替え
+      - theme はあくまで“軽いヒント”（試験モードのときはほぼ無視、日常モードのときはちょっとだけ使う）
+      - まず spec 準拠で生成 → 足りない分は exclude 指定で追加生成 → それでも足りなければ汎用 fallback
     """
     n   = int(spec.get("count", VOCAB_WORDS))
     th  = spec.get("theme") or "general vocabulary"
@@ -694,46 +699,118 @@ def _gen_vocab_list_from_spec(spec: dict, lang_code: str) -> list[str]:
     morph = spec.get("morphology") or []
     exam = (spec.get("exam") or "").strip()
     exam_level = (spec.get("exam_level") or "").strip()
+    # ★ topic_picker 側で付けている前提（無ければ "mixed" 扱いで安全に動く）
+    lex_source = (spec.get("lex_source") or "mixed").strip().lower()
+    lex_subtype = (spec.get("lex_subtype") or "").strip().lower()
+
+    # テーマはあくまで軽いヒントにする
     theme_for_prompt = translate(th, lang_code) if lang_code != "en" else th
     lang_name = LANG_NAME.get(lang_code, "the target language")
     banned = _banned_for(lang_code)
 
     lines = [
-        f"You are selecting {n} HIGH-FREQUENCY words for the topic: {theme_for_prompt}.",
-        f"Language: {lang_name}. Return ONLY one word (or short hyphenated term) per line, no numbering.",
-        "No explanations. No examples. No punctuation.",
+        f"You are selecting {n} extremely useful vocabulary items.",
+        f"Target language: {lang_name}.",
+        "Output rules:",
+        "- Return ONLY one item per line (a single word or very short fixed phrase).",
+        "- No numbering, no punctuation, no explanations.",
     ]
+
+    # どのモードで語彙を選ぶか（試験 / 日常 / ネイティブ表現）
+    if lex_source == "exam_core":
+        # 例: 英語なら CEFR、他言語なら JLPT/TOPIK/HSK/DELE などを想定
+        exam_label = ""
+        if exam and exam_level:
+            exam_label = f"{exam} {exam_level}"
+        elif spec.get("difficulty_label"):
+            exam_label = spec["difficulty_label"]
+
+        lines.append(
+            "Focus on HIGH-FREQUENCY exam and textbook vocabulary "
+            "(the kind that appears again and again in reading and listening sections)."
+        )
+        if exam_label:
+            lines.append(f"Simulate typical items from {exam_label} preparation books.")
+        if diff in ("A1","A2","B1","B2"):
+            lines.append(f"Approximate CEFR level: {diff}. Avoid rare academic words.")
+
+    elif lex_source == "daily_life":
+        # 日常会話モード
+        lines.append(
+            "Focus on HIGH-FREQUENCY everyday words that are useful in real-life conversations "
+            "at home, work, school, travel, and daily routines."
+        )
+        if theme_for_prompt:
+            lines.append(f"Use the theme only as a light hint: {theme_for_prompt}. "
+                         "Do NOT narrow the vocabulary too much to one situation.")
+        if diff in ("A1","A2","B1","B2"):
+            lines.append(f"Keep the approximate CEFR level around {diff}.")
+
+    elif lex_source == "native_phrase":
+        # ネイティブっぽい表現：短い句やコロケーションOK
+        lines.append(
+            "Focus on short, natural collocations and set phrases that native speakers actually use "
+            "in casual conversation. Items may be 1–3 words, but keep each line as one chunk."
+        )
+        if diff in ("A1","A2","B1"):
+            lines.append("Avoid rare or very idiomatic slang; keep it understandable.")
+        else:
+            lines.append("You may include some idiomatic or expressive phrases.")
+        if theme_for_prompt:
+            lines.append(f"Use this only as a soft domain hint, not a strict filter: {theme_for_prompt}.")
+
+    else:
+        # mixed / 未指定 → 安全なミックス
+        lines.append(
+            "Mix exam-friendly core vocabulary and daily-life conversation vocabulary. "
+            "Prioritize items that will stay useful for a long time."
+        )
+        if theme_for_prompt:
+            lines.append(f"Theme hint (do not overfit): {theme_for_prompt}.")
+        if diff in ("A1","A2","B1","B2"):
+            lines.append(f"Approximate CEFR level: {diff}.")
+
+    # 品詞・relation_mode・pattern_hint などのヒント
     if pos:
-        lines.append("Restrict part-of-speech to: " + ", ".join(pos) + ".")
+        lines.append("Preferred part-of-speech: " + ", ".join(pos) + ".")
     if rel == "synonym":
-        lines.append("Prefer near-synonyms around the central topic.")
+        lines.append("You may include closely related synonyms around a core sense.")
     elif rel == "antonym":
-        lines.append("Include at most one useful antonym if natural; otherwise skip.")
+        lines.append("You may include at most one useful antonym-type word, but keep the list mostly positive-use words.")
     elif rel == "collocation":
-        lines.append("Prefer common collocations used in everyday speech.")
+        lines.append("Prefer common collocations that learners can reuse in many sentences.")
     elif rel == "pattern":
-        lines.append("Prefer short reusable set phrases (but output as single tokens if possible).")
+        lines.append("Prefer reusable pattern-like chunks that fit many contexts.")
     if patt:
         lines.append(f"Pattern focus hint: {patt}.")
     if morph:
-        lines.append("If natural, include related morphological family: " + ", ".join(morph) + ".")
-    if diff in ("A1","A2","B1","B2"):
-        lines.append(f"Approximate CEFR level: {diff}. Prefer common, practical words at this level.")
-    # ★ 各言語試験ラベル（あればヒントとして加点）
-    if exam and exam_level:
-        lines.append(f"Also reflect {exam} {exam_level} typical frequency and usefulness.")
-    lines.append("Avoid over-generic hotel words (check-in / reservation / receipt / lobby / elevator equivalents).")
-    if lang_code in ("ko","ja","zh"):
-        lines.append("Use ONLY the target script. Do not use Latin letters.")
+        lines.append("If natural, prefer a mix of base forms and very common derived forms: " + ", ".join(morph) + ".")
+
+    # lex_subtype があればさらに微調整
+    if lex_subtype == "idiom":
+        lines.append("You may include a few easy idiomatic expressions, but avoid extremely obscure or culture-specific ones.")
+    elif lex_subtype == "phrasal_verb":
+        lines.append("Prefer common phrasal verbs (or similar multi-word verbs) if this fits the language.")
+    elif lex_subtype == "functional_phrase":
+        lines.append("Prefer functional phrases that can directly appear in dialogues (requests, responses, fillers, etc.).")
+
+    # 単語帳的な安全装置
+    lines.append(
+        "Avoid overly generic hotel-specific words like 'check-in', 'reservation', 'receipt', 'lobby', "
+        "and their direct equivalents in the target language."
+    )
+    if lang_code in ("ko", "ja", "zh"):
+        lines.append("Use ONLY the target script. Do NOT use Latin letters or transliteration.")
 
     prompt = "\n".join(lines)
 
+    # -------- 1段目：spec に基づいてまとめて生成 ----------
     content = ""
     for attempt in range(3):
         try:
             rsp = GPT.chat.completions.create(
                 model="gpt-4o-mini",
-                messages=[{"role":"user","content":prompt}],
+                messages=[{"role": "user", "content": prompt}],
                 temperature=LIST_TEMP + 0.05 * attempt,
                 top_p=0.9,
             )
@@ -745,15 +822,20 @@ def _gen_vocab_list_from_spec(spec: dict, lang_code: str) -> list[str]:
 
     words = _extract_words(content, lang_code, n, banned=banned)
 
+    # -------- 2段目：不足分だけ追加生成 ----------
     if len(words) < n:
         need = n - len(words)
-        prompt2 = _gen_more_words_excluding(theme_for_prompt, lang_code, need, exclude=words, diff_hint=diff if diff in ("A1","A2","B1","B2") else "")
+        prompt2 = _gen_more_words_excluding(
+            theme_for_prompt, lang_code, need,
+            exclude=words,
+            diff_hint=diff if diff in ("A1", "A2", "B1", "B2") else ""
+        )
         content2 = ""
         for attempt in range(2):
             try:
                 rsp2 = GPT.chat.completions.create(
                     model="gpt-4o-mini",
-                    messages={[{"role":"user","content":prompt2}][0:1] + [{"role":"user","content":prompt2}]},  # keep same structure
+                    messages=[{"role": "user", "content": prompt2}],
                     temperature=LIST_TEMP + 0.1 * attempt,
                     top_p=0.9,
                 )
@@ -763,10 +845,14 @@ def _gen_vocab_list_from_spec(spec: dict, lang_code: str) -> list[str]:
             if content2 and content2.strip():
                 break
         more = _extract_words(content2, lang_code, need, banned=banned | set(words))
-        words.extend([w for w in more if w not in words])
+        for w in more:
+            if w not in words:
+                words.append(w)
 
+    # -------- 3段目：それでも足りなければ汎用 fallback ----------
     if len(words) < n:
         return _gen_vocab_list(th, lang_code, n)
+
     return words[:n]
 
 # ───────────────────────────────────────────────

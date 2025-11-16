@@ -233,13 +233,16 @@ SCENE_WEIGHTS_BY_LEVEL: Dict[str, Dict[str, int]] = {
 }
 
 # ========== 語彙カテゴリ（単語用）定義 ==========
-# 単語は「functional/scene」ではなく、このカテゴリ＋CEFRで選ぶ
+# ※ main.py 側の lex_source 判定と揃える:
+#   - "exam_core"      → 試験・教科書頻出
+#   - "daily_life"     → 日常会話・サバイバル系
+#   - "native_phrase"  → ネイティブ表現（句動詞・イディオム）
+#   - "mixed"          → その中間
 VOCAB_SOURCES = {
-    "exam_core": "exam core vocabulary",             # 試験頻出・アカデミックより
-    "core_general": "core general vocabulary",       # NGSL 等のコア語彙
-    "daily_conversation": "everyday spoken vocabulary",  # 日常会話でよく使う
-    "survival_travel": "travel & survival vocabulary",   # 旅行・生活サバイバル
-    "idioms_phrasal": "idioms & phrasal verbs",      # 熟語・句動詞系
+    "exam_core": "exam core vocabulary",               # JLPT / TOPIK / HSK / DELE などの頻出
+    "daily_life": "everyday spoken & travel vocabulary",
+    "native_phrase": "natural phrases & collocations",
+    "mixed": "mixed core & everyday vocabulary",
 }
 
 def _env_level() -> str:
@@ -247,12 +250,71 @@ def _env_level() -> str:
     # ENV が有効ならそれ、無ければ A2/B1/B2 からランダム（= 既存互換）
     return v if v in ("A1", "A2", "B1", "B2") else rng.choice(["A2", "B1", "B2"])
 
+def _study_mode() -> str:
+    """
+    学習モード:
+      - exam   : 試験・教科書語彙寄り
+      - daily  : 日常会話寄り
+      - mixed  : その中間
+    """
+    m = os.getenv("STUDY_MODE", "exam").strip().lower()
+    return m if m in ("exam", "daily", "mixed") else "exam"
+
 def _choose_weighted(items: List[Tuple[str, int]]) -> str:
     pool, weights = zip(*[(k, max(0, w)) for k, w in items if w > 0])
     return rng.choices(pool, weights=weights, k=1)[0]
 
 def _weights_from_dict(keys: List[str], table: Dict[str, int]) -> List[Tuple[str, int]]:
     return [(k, table.get(k, 1)) for k in keys]
+
+# CEFR × STUDY_MODE ごとの推奨品詞ミックス（6語想定）
+POS_MIX = {
+    "exam": {
+        "A1": ["noun", "noun", "noun", "verb", "verb", "expression"],
+        "A2": ["noun", "noun", "verb", "verb", "adjective", "expression"],
+        "B1": ["verb", "verb", "noun", "adjective", "expression", "expression"],
+        "B2": ["verb", "verb", "expression", "expression", "expression", "noun"],
+    },
+    "daily": {
+        "A1": ["verb", "verb", "noun", "noun", "expression", "expression"],
+        "A2": ["verb", "verb", "noun", "adjective", "expression", "expression"],
+        "B1": ["verb", "verb", "expression", "expression", "adjective", "noun"],
+        "B2": ["verb", "verb", "expression", "expression", "expression", "adjective"],
+    },
+    "mixed": {
+        "A1": ["noun", "noun", "verb", "verb", "expression", "expression"],
+        "A2": ["noun", "verb", "verb", "adjective", "expression", "expression"],
+        "B1": ["verb", "verb", "noun", "expression", "expression", "adjective"],
+        "B2": ["verb", "verb", "expression", "expression", "expression", "noun"],
+    },
+}
+
+def _pos_mix_for(cefr: str) -> list:
+    """
+    CEFR × STUDY_MODE から、1ラウンドの理想品詞ミックスを返す。
+    例: ["noun","verb","verb","adjective","expression","expression"]
+    """
+    mode = _study_mode()
+    level = (cefr or "").upper()
+    base = POS_MIX.get(mode, POS_MIX["exam"]).get(level)
+
+    if not base:
+        # レベル不明なら無難な初級後半パターン
+        base = ["noun", "noun", "verb", "verb", "adjective", "expression"]
+
+    target_n = int(os.getenv("VOCAB_WORDS", "6"))
+    if target_n == len(base):
+        return base
+
+    if target_n < len(base):
+        return base[:target_n]
+
+    # 欠け分は「動詞→表現→名詞→形容詞」の順で増やす
+    extra: list = []
+    order = ["verb", "expression", "noun", "adjective"]
+    while len(base) + len(extra) < target_n:
+        extra.append(order[len(extra) % len(order)])
+    return base + extra
 
 def _pick_functional() -> str:
     # いまは単語では使わないが、後方互換用に残す
@@ -383,31 +445,29 @@ def _pick_lex_source(audio_lang: str) -> str:
     """
     単語用の語彙カテゴリを選ぶ。
     ENV:
-      - LEX_SOURCE=exam_core/core_general/... で強制指定可能。
+      - LEX_SOURCE=exam_core/daily_life/native_phrase/mixed で強制指定可能。
     """
     override = os.getenv("LEX_SOURCE", "").strip()
     if override and override in VOCAB_SOURCES:
         return override
 
-    # デフォルトの重み（長尺向けにバランス良く）
+    # デフォルトの重み（言語に応じて少しバイアス）
     base_weights = {
-        "exam_core": 3,
-        "core_general": 4,
-        "daily_conversation": 3,
-        "survival_travel": 2,
-        "idioms_phrasal": 2,
+        "exam_core": 4,        # 試験寄りを少し厚め
+        "daily_life": 3,       # 日常会話・トラベル
+        "native_phrase": 2,    # 表現・コロケーション
+        "mixed": 3,
     }
 
-    # 言語別に少しだけ傾向を変えたい場合はここで調整
     lang = (audio_lang or "").lower()
     if lang == "ja":
         # 日本語：JLPT＋日常会話を少し厚めに
         base_weights["exam_core"] += 1
-        base_weights["daily_conversation"] += 1
+        base_weights["daily_life"] += 1
     elif lang == "ko":
         base_weights["exam_core"] += 1
     elif lang == "es":
-        base_weights["daily_conversation"] += 1
+        base_weights["daily_life"] += 1
 
     items = list(base_weights.items())
     return _choose_weighted(items)
@@ -415,33 +475,72 @@ def _pick_lex_source(audio_lang: str) -> str:
 def _build_vocab_spec(audio_lang: str) -> dict:
     """
     単語（vocab）専用 spec。
-    functional / scene は使わず、
+    functional / scene ではなく、
     - lex_source（語彙カテゴリ）
     - difficulty（CEFR / 試験ラベル）
-    だけで単語を選ぶ。
+    - pos / pos_plan（品詞ミックス）
+    を中心に main.py 側へ渡す。
     """
     cefr = _random_difficulty()
     meta = _difficulty_metadata(audio_lang, cefr)
     lex_source = _pick_lex_source(audio_lang)
     lex_label = VOCAB_SOURCES.get(lex_source, lex_source)
 
+    # 1語ごとの理想品詞の並び（例: ["noun","verb","verb","adjective","expression"...]）
+    pos_plan = _pos_mix_for(cefr)
+
+    # ENVで強制指定がある場合は、それも全体情報として残す
+    env_pos = _random_pos_from_env_or_default()
+    if env_pos:
+        pos_overall = env_pos
+    else:
+        # pos_plan の「集合」を全体POSとして入れておく（プロンプト用）
+        pos_overall = sorted(set(pos_plan))
+
+    # lex_sourceごとの細かい分類（main.py の lex_subtype 用）
+    if lex_source == "native_phrase":
+        lex_subtype = "phrasal_verb"
+    elif lex_source == "daily_life":
+        lex_subtype = "functional_phrase"
+    else:
+        lex_subtype = ""
+
+    # テーマラベル（タイトル・サムネ用）
+    if meta["exam"] and meta["exam_level"] and lex_source == "exam_core":
+        # 例: "JLPT N4 core vocabulary"
+        theme_label = f"{meta['exam']} {meta['exam_level']} core vocabulary"
+    else:
+        theme_label = lex_label  # "everyday spoken & travel vocabulary" など
+
     spec = {
-        # vocab では「テーマ文脈」は使わないので空にしておく
-        "theme": "",
+        # タイトル・サムネ用のテーマ文字列
+        "theme": theme_label,
         "context": "",
+
+        # 1ラウンドの単語数
         "count": int(os.getenv("VOCAB_WORDS", "6")),
-        "pos": _random_pos_from_env_or_default(),
+
+        # 全体としてどの品詞を扱うか（プロンプト用）
+        "pos": pos_overall,
+        # 1語ごとの理想品詞並び（今は main.py 側では未使用だが、将来用）
+        "pos_plan": pos_plan,
+
         "relation_mode": os.getenv("RELATION_MODE", "").strip().lower(),
-        "difficulty": cefr,                     # CEFR A1/A2/B1/B2
-        "difficulty_label": meta["label"],      # 例: "CEFR A2 / JLPT N4"
-        "exam": meta["exam"],                   # 例: "JLPT"
-        "exam_level": meta["exam_level"],       # 例: "N4"
-        # vocab では pattern は使わないので空
+
+        # 難易度・試験情報
+        "difficulty": cefr,                 # CEFR A1/A2/B1/B2
+        "difficulty_label": meta["label"],  # 例: "CEFR A2 / JLPT N4"
+        "exam": meta["exam"],               # 例: "JLPT"
+        "exam_level": meta["exam_level"],   # 例: "N4"
+
+        # vocab では pattern は使わないが、フィールド自体は後方互換のため残す
         "pattern_hint": "",
         "morphology": _parse_csv_env("MORPHOLOGY"),
-        # 新規：語彙カテゴリ
-        "lex_source": lex_source,               # 例: "exam_core"
-        "lex_source_label": lex_label,          # 例: "exam core vocabulary"
+
+        # 語彙カテゴリ
+        "lex_source": lex_source,               # main.py 側の分岐用: exam_core/daily_life/native_phrase/mixed
+        "lex_source_label": lex_label,          # サムネ・表示用
+        "lex_subtype": lex_subtype,             # native_phrase / daily_life などのサブタイプ
     }
     return spec
 
@@ -462,7 +561,8 @@ def pick_by_content_type(content_type: str, audio_lang: str, return_context: boo
         語彙カテゴリ（lex_source）＋難易度で単語セットを決定する。
     ENV:
       - CEFR_LEVEL=A1/A2/B1/B2 で難易度固定
-      - LEX_SOURCE=exam_core/core_general/... で語彙カテゴリ固定
+      - LEX_SOURCE=exam_core/daily_life/native_phrase/mixed で語彙カテゴリ固定
+      - STUDY_MODE=exam/daily/mixed で品詞ミックスの比率を変える
       - THEME_OVERRIDE: return_context=False のときだけ、タイトル文字列を上書き
     """
     ct = (content_type or "vocab").lower()
@@ -477,8 +577,8 @@ def pick_by_content_type(content_type: str, audio_lang: str, return_context: boo
         spec = _build_vocab_spec(audio_lang)
 
         if not return_context:
-            # サムネ用など：語彙カテゴリラベルをそのまま返す
-            return spec.get("lex_source_label") or "general vocabulary"
+            # サムネ用など：語彙カテゴリラベルまたは theme を返す
+            return spec.get("theme") or spec.get("lex_source_label") or "general vocabulary"
 
         return spec
 

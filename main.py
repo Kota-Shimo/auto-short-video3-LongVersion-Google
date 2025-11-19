@@ -1,10 +1,7 @@
-
-
-
 #!/usr/bin/env python
 """
 main.py – VOCAB専用ロング動画（横向き16:9 / ラウンド制 / 日本語TTS最適化）
-- 1ラウンド = N単語（単語→単語→例文×N） + そのN語をすべて含む会話
+- 1ラウンド = N単語（L1訳 → L2単語×リピート → L1例文訳 → L2例文）×N語 + そのN語をすべて含む会話
 - ラウンドごとに「単語群→会話」を入れて次の単語群へ進む（群ごと対話）
 - 例文は常に「1文だけ」。失敗時は最大6回まで再生成、最後はフェールセーフ。
 - 翻訳（字幕）は1行化、複文は先頭1文のみ採用。URL/絵文字/余分な空白を除去。
@@ -60,10 +57,9 @@ LIST_TEMP       = float(os.getenv("LIST_TEMP", "0.30")) # 語彙リスト
 # 語彙・ラウンド
 VOCAB_WORDS   = int(os.getenv("VOCAB_WORDS", "6"))      # 1ラウンドの単語数
 VOCAB_ROUNDS  = int(os.getenv("VOCAB_ROUNDS", "1"))     # ラウンド数
-CONVO_LINES   = int(os.getenv("CONVO_LINES", "15"))      # そのラウンド末の会話行数（偶数推奨）
-# ← 既存: VOCAB_WORDS / VOCAB_ROUNDS / CONVO_LINES の定義の下あたりに追加
-WORD_REPEAT = int(os.getenv("WORD_REPEAT", "1"))  # 既定=2回（従来互換）
-NO_CONVO    = os.getenv("NO_CONVO", "0") == "1"   # 1で会話ブロックをスキップ
+CONVO_LINES   = int(os.getenv("CONVO_LINES", "15"))     # そのラウンド末の会話行数（偶数推奨）
+WORD_REPEAT   = int(os.getenv("WORD_REPEAT", "1"))      # 単語リピート回数
+NO_CONVO      = os.getenv("NO_CONVO", "0") == "1"       # 1で会話ブロックをスキップ
 
 # 横向き 16:9 レンダ設定（chunk_builder に渡す）
 RENDER_SIZE   = os.getenv("RENDER_SIZE", "1920x1080")
@@ -473,7 +469,7 @@ def _gen_example_sentence(word: str, lang_code: str, context_hint: str = "", dif
         user = (
             f"{rules} "
             f"다음 단어를 반드시 포함하여 한국어로 자연스러운 문장을 정확히 1개만 쓰세요: {word} "
-            "대괄호나 번역 메モ 금지. 영문자使用 금지."
+            "대괄호나 번역 메모 금지. 영문자使用 금지."
             "가능하면 기본형에 가깝게 쓰되, 부자연스러우면 활용해도 됩니다."
             f"{level_line}"
         )
@@ -1146,6 +1142,13 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
             except Exception:
                 sub_rows[r].append(_clean_sub_line(intro_line, lang))
 
+    # 学習者の母語（L1）推定：subs の中で audio_lang 以外の先頭を L1 とする
+    if len(subs) >= 2:
+        learner_candidates = [lng for lng in subs if lng != audio_lang]
+        learner_lang = learner_candidates[0] if learner_candidates else audio_lang
+    else:
+        learner_lang = audio_lang
+
     # ラウンドごとの処理
     seen_words: set[str] = set()
     round_count = VOCAB_ROUNDS
@@ -1168,38 +1171,97 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
         else:
             words_round = _pick_unique_words(master_theme, audio_lang, VOCAB_WORDS, base_spec, seen_words)
 
-        # 保険：このラウンド確定語を即時 seen に（デバッグログも）
+        # 保険：このラウンド確定語を即時 seen に
         for _w in words_round:
             _key = _w.lower() if audio_lang not in ("ja","ko","zh") else _w
-            if _key in seen_words:
-                logging.info(f"[DEDUP] skip-dup {_w}")
             seen_words.add(_key)
 
-        # 2) 単語→単語→例文（×N語）
+        # 2) 単語ごとのブロック（L1訳 → L2単語×リピート → L1例文訳 → L2例文）
         round_examples: list[str] = []
         difficulty_for_this = base_spec.get("difficulty") if isinstance(base_spec, dict) else None
 
         for w in words_round:
-            # 難易度を一緒に渡す（_gen_example_sentence 内で CEFRレベル調整）
+            # 例文生成
             if difficulty_for_this:
                 ex = _gen_example_sentence(w, audio_lang, master_context, difficulty=difficulty_for_this)
             else:
                 ex = _gen_example_sentence(w, audio_lang, master_context)
 
-            # ❗例文取得に失敗した語はスキップ（フォールバック禁止）
+            # 例文取得に失敗した語はスキップ
             if ex is None or not ex.strip():
                 logging.warning(f"[SKIP] example generation failed for '{w}' ({audio_lang})")
                 continue
 
             round_examples.append(ex)
 
-            # 単語
+            # ── この単語の訳・例文訳を各言語分まとめて用意 ──
+            word_translations: dict[str, str] = {}
+            example_translations: dict[str, str] = {}
+
+            for lang in subs:
+                if lang == audio_lang:
+                    word_translations[lang] = w
+                    example_translations[lang] = ex
+                else:
+                    # 単語の1語訳（文脈付き）
+                    try:
+                        pos_hint = None
+                        if isinstance(base_spec, dict) and base_spec.get("pos"):
+                            pos_hint = ",".join(base_spec["pos"])
+                        elif audio_lang == "ja":
+                            _k = _guess_ja_pos(w)
+                            pos_map = {"verb":"verb", "iadj":"adjective", "naadj":"adjective", "noun":"noun"}
+                            pos_hint = pos_map.get(_k, None)
+                        trans_word = translate_word_context(
+                            word=w, target_lang=lang, src_lang=audio_lang,
+                            theme=master_theme, example=ex, pos_hint=pos_hint
+                        )
+                    except Exception:
+                        trans_word = w
+                    word_translations[lang] = trans_word
+
+                    # 例文訳
+                    try:
+                        trans_ex = translate_sentence_strict(ex, src_lang=audio_lang, target_lang=lang)
+                    except Exception:
+                        trans_ex = ex
+                    example_translations[lang] = trans_ex
+
+            # ── ① L1訳 ──
+            if learner_lang != audio_lang and learner_lang in word_translations:
+                line_l1_word = word_translations[learner_lang]
+                tts_l1_word = line_l1_word or ""
+
+                if learner_lang == "ja":
+                    tts_l1_word = normalize_ja_for_tts(tts_l1_word)
+                    style_for_tts = "calm"
+                else:
+                    tts_l1_word = _ensure_period_for_sentence(tts_l1_word, learner_lang)
+                    if learner_lang in ("ko","ja","zh"):
+                        tts_l1_word = _purge_ascii_for_tts(tts_l1_word, learner_lang)
+                    else:
+                        tts_l1_word = _clean_non_english_ascii(tts_l1_word, learner_lang)
+                    style_for_tts = "neutral"
+
+                out_audio = TEMP / f"{len(audio_parts)+1:02d}.wav"
+                speak(learner_lang, "N", tts_l1_word, out_audio, style=style_for_tts)
+                audio_parts.append(out_audio)
+                plain_lines.append(line_l1_word)
+                tts_lines.append(tts_l1_word)
+
+                # 字幕：各言語の単語訳
+                for r, lang in enumerate(subs):
+                    text_for_sub = word_translations.get(lang, line_l1_word)
+                    sub_rows[r].append(_clean_sub_line(text_for_sub, lang))
+
+            # ── ② L2単語 × WORD_REPEAT ──
             for _rep in range(WORD_REPEAT):
-                line = w
-                tts_line = line
+                line_l2_word = w
+                tts_line = line_l2_word
+
                 if audio_lang == "ja":
-                    if _KANJI_ONLY.fullmatch(line):
-                        yomi = _kana_reading(line)
+                    if _KANJI_ONLY.fullmatch(line_l2_word):
+                        yomi = _kana_reading(line_l2_word)
                         if yomi:
                             tts_line = yomi
                     base = re.sub(r"[。！？!?]+$", "", tts_line).strip()
@@ -1207,48 +1269,59 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
                     tts_line = normalize_ja_for_tts(tts_line)
                 else:
                     tts_line = _ensure_period_for_sentence(tts_line, audio_lang)
+
                 if audio_lang in ("ko","ja","zh"):
                     tts_line = _purge_ascii_for_tts(tts_line, audio_lang)
                 else:
                     tts_line = _clean_non_english_ascii(tts_line, audio_lang)
 
                 out_audio = TEMP / f"{len(audio_parts)+1:02d}.wav"
-                style_for_tts = "neutral"
-                speak(audio_lang, "N", tts_line, out_audio, style=style_for_tts)
+                speak(audio_lang, "N", tts_line, out_audio, style="neutral")
                 audio_parts.append(out_audio)
-                plain_lines.append(line)
+                plain_lines.append(line_l2_word)
                 tts_lines.append(tts_line)
 
-                # 字幕
+                # 字幕：ここも「単語の意味」を各言語で揃える
                 for r, lang in enumerate(subs):
-                    if lang == audio_lang:
-                        sub_rows[r].append(_clean_sub_line(line, lang))
-                    else:
-                        try:
-                            pos_hint = None
-                            if isinstance(base_spec, dict) and base_spec.get("pos"):
-                                pos_hint = ",".join(base_spec["pos"])
-                            elif audio_lang == "ja":
-                                _k = _guess_ja_pos(line)
-                                pos_map = {"verb":"verb", "iadj":"adjective", "naadj":"adjective", "noun":"noun"}
-                                pos_hint = pos_map.get(_k, None)
-                            trans = translate_word_context(
-                                word=line, target_lang=lang, src_lang=audio_lang,
-                                theme=master_theme, example=ex, pos_hint=pos_hint
-                            )
-                        except Exception:
-                            trans = line
-                        sub_rows[r].append(_clean_sub_line(trans, lang))
+                    text_for_sub = word_translations.get(lang, line_l2_word if lang == audio_lang else line_l2_word)
+                    sub_rows[r].append(_clean_sub_line(text_for_sub, lang))
 
-            # 例文（1文）
-            line = ex
+            # ── ③ L1例文訳 ──
+            if learner_lang != audio_lang and learner_lang in example_translations:
+                line_l1_ex = example_translations[learner_lang]
+                tts_l1_ex = line_l1_ex or ""
+
+                if learner_lang == "ja":
+                    tts_l1_ex = normalize_ja_for_tts(tts_l1_ex)
+                    style_for_tts = "calm"
+                else:
+                    tts_l1_ex = _ensure_period_for_sentence(tts_l1_ex, learner_lang)
+                    if learner_lang in ("ko","ja","zh"):
+                        tts_l1_ex = _purge_ascii_for_tts(tts_l1_ex, learner_lang)
+                    else:
+                        tts_l1_ex = _clean_non_english_ascii(tts_l1_ex, learner_lang)
+                    style_for_tts = "calm"
+
+                out_audio = TEMP / f"{len(audio_parts)+1:02d}.wav"
+                speak(learner_lang, "N", tts_l1_ex, out_audio, style=style_for_tts)
+                audio_parts.append(out_audio)
+                plain_lines.append(line_l1_ex)
+                tts_lines.append(tts_l1_ex)
+
+                # 字幕：例文の意味を各言語で
+                for r, lang in enumerate(subs):
+                    text_for_sub = example_translations.get(lang, line_l1_ex)
+                    sub_rows[r].append(_clean_sub_line(text_for_sub, lang))
+
+            # ── ④ L2例文 ──
+            line_l2_ex = ex
             if audio_lang == "ja":
-                tts_line = _PARENS_JA.sub(" ", line).strip()
+                tts_line = _PARENS_JA.sub(" ", line_l2_ex).strip()
                 tts_line = _ensure_period_for_sentence(tts_line, audio_lang)
                 tts_line = normalize_ja_for_tts(tts_line)
                 style_for_tts = "calm"
             else:
-                tts_line = _ensure_period_for_sentence(line, audio_lang)
+                tts_line = _ensure_period_for_sentence(line_l2_ex, audio_lang)
                 style_for_tts = "calm"
 
             if audio_lang in ("ko","ja","zh"):
@@ -1259,17 +1332,12 @@ def run_one(topic, turns, audio_lang, subs, title_lang, yt_privacy, account, do_
             out_audio = TEMP / f"{len(audio_parts)+1:02d}.wav"
             speak(audio_lang, "N", tts_line, out_audio, style=style_for_tts)
             audio_parts.append(out_audio)
-            plain_lines.append(line)
+            plain_lines.append(line_l2_ex)
             tts_lines.append(tts_line)
+
             for r, lang in enumerate(subs):
-                if lang == audio_lang:
-                    sub_rows[r].append(_clean_sub_line(line, lang))
-                else:
-                    try:
-                        trans = translate_sentence_strict(line, src_lang=audio_lang, target_lang=lang)
-                    except Exception:
-                        trans = line
-                    sub_rows[r].append(_clean_sub_line(trans, lang))
+                text_for_sub = example_translations.get(lang, line_l2_ex if lang == audio_lang else line_l2_ex)
+                sub_rows[r].append(_clean_sub_line(text_for_sub, lang))
 
         # 3) まとめ会話（このラウンドの語を全部使う）
         if not NO_CONVO and round_examples:

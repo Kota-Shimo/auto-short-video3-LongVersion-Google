@@ -1,7 +1,7 @@
 name: Auto-Vocab-Daily
 
 on:
-  schedule:
+  #schedule:
     - cron: '0 19 * * *'   # JST04:00 → Pattern①(会話なし) Group A acc1–3
     - cron: '0 21 * * *'   # JST06:00 → Pattern①(会話なし) Group B acc4–6
     - cron: '0 3 * * *'   # JST12:00 → Pattern①(会話なし) Group C acc7–9
